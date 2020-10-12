@@ -1,15 +1,16 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
 #include "detector.hpp"
 
 #include <algorithm>
-#include <iostream>
 #include <string>
 #include <map>
 #include <opencv2/core/core.hpp>
 #include <inference_engine.hpp>
+
+#include <ngraph/ngraph.hpp>
 
 using namespace InferenceEngine;
 
@@ -68,12 +69,21 @@ void ObjectDetector::enqueue(const cv::Mat &frame) {
         request = net_.CreateInferRequestPtr();
     }
 
-    width_ = frame.cols;
-    height_ = frame.rows;
+    width_ = static_cast<float>(frame.cols);
+    height_ = static_cast<float>(frame.rows);
 
     Blob::Ptr inputBlob = request->GetBlob(input_name_);
 
     matU8ToBlob<uint8_t>(frame, inputBlob);
+
+    if (!im_info_name_.empty()) {
+        LockedMemory<void> imInfoMapped = as<MemoryBlob>(request->GetBlob(im_info_name_))->wmap();
+        float* buffer = imInfoMapped.as<float*>();
+        buffer[0] = static_cast<float>(inputBlob->getTensorDesc().getDims()[2]);
+        buffer[1] = static_cast<float>(inputBlob->getTensorDesc().getDims()[3]);
+        buffer[2] = buffer[4] = static_cast<float>(inputBlob->getTensorDesc().getDims()[3]) / width_;
+        buffer[3] = buffer[5] = static_cast<float>(inputBlob->getTensorDesc().getDims()[2]) / height_;
+    }
 
     enqueued_frames_ = 1;
 }
@@ -86,64 +96,59 @@ void ObjectDetector::submitFrame(const cv::Mat &frame, int frame_idx) {
 
 ObjectDetector::ObjectDetector(
     const DetectorConfig& config,
-    const InferenceEngine::InferencePlugin& plugin) :
+    const InferenceEngine::Core & ie,
+    const std::string & deviceName) :
     config_(config),
-    plugin_(plugin) {
-    CNNNetReader net_reader;
-    net_reader.ReadNetwork(config.path_to_model);
-    net_reader.ReadWeights(config.path_to_weights);
-    if (!net_reader.isParseSuccess()) {
-        THROW_IE_EXCEPTION << "Cannot load model";
-    }
+    ie_(ie),
+    deviceName_(deviceName) {
+    auto cnnNetwork = ie_.ReadNetwork(config.path_to_model);
 
-    InputsDataMap inputInfo(net_reader.getNetwork().getInputsInfo());
-    if (inputInfo.size() != 1) {
-        THROW_IE_EXCEPTION << "Face Detection network should have only one input";
+    InputsDataMap inputInfo(cnnNetwork.getInputsInfo());
+    if (1 == inputInfo.size() || 2 == inputInfo.size()) {
+        for (const std::pair<std::string, InputInfo::Ptr>& input : inputInfo) {
+            InputInfo::Ptr inputInfo = input.second;
+            if (4 == inputInfo->getTensorDesc().getDims().size()) {
+                inputInfo->setPrecision(Precision::U8);
+                inputInfo->getInputData()->setLayout(Layout::NCHW);
+                input_name_ = input.first;
+            } else if (SizeVector{1, 6} == inputInfo->getTensorDesc().getDims()) {
+                inputInfo->setPrecision(Precision::FP32);
+                im_info_name_ = input.first;
+            } else {
+                THROW_IE_EXCEPTION << "Unknown input for Person Detection network";
+            }
+        }
+        if (input_name_.empty()) {
+            THROW_IE_EXCEPTION << "No image input for Person Detection network found";
+        }
+    } else {
+        THROW_IE_EXCEPTION << "Person Detection network should have one or two inputs";
     }
     InputInfo::Ptr inputInfoFirst = inputInfo.begin()->second;
     inputInfoFirst->setPrecision(Precision::U8);
     inputInfoFirst->getInputData()->setLayout(Layout::NCHW);
 
-    SizeVector input_dims = inputInfoFirst->getInputData()->getTensorDesc().getDims();
-    input_dims[2] = config_.input_h;
-    input_dims[3] = config_.input_w;
-    std::map<std::string, SizeVector> input_shapes;
-    input_shapes[inputInfo.begin()->first] = input_dims;
-    net_reader.getNetwork().reshape(input_shapes);
-
-    OutputsDataMap outputInfo(net_reader.getNetwork().getOutputsInfo());
+    OutputsDataMap outputInfo(cnnNetwork.getOutputsInfo());
     if (outputInfo.size() != 1) {
-        THROW_IE_EXCEPTION << "Face Detection network should have only one output";
+        THROW_IE_EXCEPTION << "Person Detection network should have only one output";
     }
     DataPtr& _output = outputInfo.begin()->second;
     output_name_ = outputInfo.begin()->first;
 
-    const CNNLayerPtr outputLayer = net_reader.getNetwork().getLayerByName(output_name_.c_str());
-    if (outputLayer->type != "DetectionOutput") {
-        THROW_IE_EXCEPTION << "Face Detection network output layer(" + outputLayer->name +
-            ") should be DetectionOutput, but was " +  outputLayer->type;
-    }
-
-    if (outputLayer->params.find("num_classes") == outputLayer->params.end()) {
-        THROW_IE_EXCEPTION << "Face Detection network output layer (" +
-            output_name_ + ") should have num_classes integer attribute";
-    }
-
     const SizeVector outputDims = _output->getTensorDesc().getDims();
+    if (outputDims.size() != 4) {
+        THROW_IE_EXCEPTION << "Person Detection network output dimensions not compatible shoulld be 4, but was " +
+            std::to_string(outputDims.size());
+    }
     max_detections_count_ = outputDims[2];
     object_size_ = outputDims[3];
     if (object_size_ != 7) {
-        THROW_IE_EXCEPTION << "Face Detection network output layer should have 7 as a last dimension";
-    }
-    if (outputDims.size() != 4) {
-        THROW_IE_EXCEPTION << "Face Detection network output dimensions not compatible shoulld be 4, but was " +
-            std::to_string(outputDims.size());
+        THROW_IE_EXCEPTION << "Person Detection network output layer should have 7 as a last dimension";
     }
     _output->setPrecision(Precision::FP32);
     _output->setLayout(TensorDesc::getLayoutByDims(_output->getDims()));
 
-    input_name_ = inputInfo.begin()->first;
-    net_ = plugin_.LoadNetwork(net_reader.getNetwork(), {});
+    net_ = ie_.LoadNetwork(cnnNetwork, deviceName_);
 }
 
 void ObjectDetector::wait() {
@@ -155,7 +160,8 @@ void ObjectDetector::fetchResults() {
     results_.clear();
     if (results_fetched_) return;
     results_fetched_ = true;
-    const float *data = request->GetBlob(output_name_)->buffer().as<float *>();
+    LockedMemory<const void> outputMapped = as<MemoryBlob>(request->GetBlob(output_name_))->rmap();
+    const float *data = outputMapped.as<float *>();
 
     for (int det_id = 0; det_id < max_detections_count_; ++det_id) {
         const int start_pos = det_id * object_size_;
@@ -177,13 +183,15 @@ void ObjectDetector::fetchResults() {
 
         TrackedObject object;
         object.confidence = score;
-        object.rect = cv::Rect(cv::Point(round(x0), round(y0)),
-                               cv::Point(round(x1), round(y1)));
+        object.rect = cv::Rect(cv::Point(static_cast<int>(round(static_cast<double>(x0))),
+                                         static_cast<int>(round(static_cast<double>(y0)))),
+                               cv::Point(static_cast<int>(round(static_cast<double>(x1))),
+                                         static_cast<int>(round(static_cast<double>(y1)))));
 
         object.rect = TruncateToValidRect(IncreaseRect(object.rect,
                                                        config_.increase_scale_x,
                                                        config_.increase_scale_y),
-                                          cv::Size(width_, height_));
+                                          cv::Size(static_cast<int>(width_), static_cast<int>(height_)));
         object.frame_idx = frame_idx_;
 
         if (object.confidence > config_.confidence_threshold && object.rect.area() > 0) {
@@ -197,8 +205,7 @@ void ObjectDetector::waitAndFetchResults() {
     fetchResults();
 }
 
-void ObjectDetector::PrintPerformanceCounts() {
+void ObjectDetector::PrintPerformanceCounts(std::string fullDeviceName) {
     std::cout << "Performance counts for object detector" << std::endl << std::endl;
-    ::printPerformanceCounts(request->GetPerformanceCounts(), std::cout, false);
+    ::printPerformanceCounts(*request, std::cout, fullDeviceName, false);
 }
-

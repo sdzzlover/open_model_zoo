@@ -1,4 +1,4 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -19,12 +19,15 @@
 #include <map>
 #include <string>
 #include <vector>
+#include <set>
 
 #include <inference_engine.hpp>
 
+#include <monitors/presenter.h>
+#include <samples/images_capture.h>
+#include <samples/slog.hpp>
 #include <samples/ocv_common.hpp>
 #include "crossroad_camera_demo.hpp"
-#include <ext_list.hpp>
 
 using namespace InferenceEngine;
 
@@ -34,10 +37,11 @@ bool ParseAndCheckCommandLine(int argc, char *argv[]) {
     gflags::ParseCommandLineNonHelpFlags(&argc, &argv, true);
     if (FLAGS_h) {
         showUsage();
+        showAvailableDevices();
         return false;
     }
 
-    std::cout << "[ INFO ] Parsing input parameters" << std::endl;
+    slog::info << "Parsing input parameters" << slog::endl;
 
     if (FLAGS_i.empty()) {
         throw std::logic_error("Parameter -i is not set");
@@ -54,7 +58,6 @@ bool ParseAndCheckCommandLine(int argc, char *argv[]) {
 
 struct BaseDetection {
     ExecutableNetwork net;
-    InferencePlugin plugin;
     InferRequest request;
     std::string & commandLineFlag;
     std::string topoName;
@@ -62,13 +65,13 @@ struct BaseDetection {
     std::string inputName;
     std::string outputName;
 
-    BaseDetection(std::string &commandLineFlag, std::string topoName)
+    BaseDetection(std::string &commandLineFlag, const std::string &topoName)
             : commandLineFlag(commandLineFlag), topoName(topoName) {}
 
     ExecutableNetwork * operator ->() {
         return &net;
     }
-    virtual CNNNetwork read()  = 0;
+    virtual CNNNetwork read(const Core& ie)  = 0;
 
     virtual void setRoiBlob(const Blob::Ptr &roiBlob) {
         if (!enabled())
@@ -110,19 +113,23 @@ struct BaseDetection {
         if (!enablingChecked) {
             _enabled = !commandLineFlag.empty();
             if (!_enabled) {
-                std::cout << "[ INFO ] " << topoName << " detection DISABLED" << std::endl;
+                slog::info << topoName << " detection DISABLED" << slog::endl;
             }
             enablingChecked = true;
         }
         return _enabled;
+    }
+
+    void printPerformanceCounts(std::string fullDeviceName) const {
+        ::printPerformanceCounts(request, std::cout, fullDeviceName);
     }
 };
 
 struct PersonDetection : BaseDetection{
     int maxProposalCount;
     int objectSize;
-    float width = 0;
-    float height = 0;
+    float width = 0.0f;
+    float height = 0.0f;
     bool resultsFetched = false;
 
     struct Result {
@@ -140,40 +147,36 @@ struct PersonDetection : BaseDetection{
     }
 
     void setRoiBlob(const Blob::Ptr &frameBlob) override {
-        height = frameBlob->getTensorDesc().getDims()[2];
-        width = frameBlob->getTensorDesc().getDims()[3];
+        height = static_cast<float>(frameBlob->getTensorDesc().getDims()[2]);
+        width = static_cast<float>(frameBlob->getTensorDesc().getDims()[3]);
         BaseDetection::setRoiBlob(frameBlob);
     }
 
     void enqueue(const cv::Mat &frame) override {
-        height = frame.rows;
-        width = frame.cols;
+        height = static_cast<float>(frame.rows);
+        width = static_cast<float>(frame.cols);
         BaseDetection::enqueue(frame);
     }
 
-    PersonDetection() : BaseDetection(FLAGS_m, "Person Detection") {}
-    CNNNetwork read() override {
-        std::cout << "[ INFO ] Loading network files for PersonDetection" << std::endl;
-        CNNNetReader netReader;
+    PersonDetection() : BaseDetection(FLAGS_m, "Person Detection"), maxProposalCount(0), objectSize(0) {}
+    CNNNetwork read(const Core& ie) override {
+        slog::info << "Loading network files for PersonDetection" << slog::endl;
         /** Read network model **/
-        netReader.ReadNetwork(FLAGS_m);
+        auto network = ie.ReadNetwork(FLAGS_m);
         /** Set batch size to 1 **/
-        std::cout << "[ INFO ] Batch size is forced to  1" << std::endl;
-        netReader.getNetwork().setBatchSize(1);
-        /** Extract model name and load it's weights **/
-        std::string binFileName = fileNameNoExt(FLAGS_m) + ".bin";
-        netReader.ReadWeights(binFileName);
+        slog::info << "Batch size is forced to  1" << slog::endl;
+        network.setBatchSize(1);
         // -----------------------------------------------------------------------------------------------------
 
         /** SSD-based network should have one input and one output **/
         // ---------------------------Check inputs ------------------------------------------------------
-        std::cout << "[ INFO ] Checking Person Detection inputs" << std::endl;
-        InputsDataMap inputInfo(netReader.getNetwork().getInputsInfo());
+        slog::info << "Checking Person Detection inputs" << slog::endl;
+        InputsDataMap inputInfo(network.getInputsInfo());
         if (inputInfo.size() != 1) {
             throw std::logic_error("Person Detection network should have only one input");
         }
         InputInfo::Ptr& inputInfoFirst = inputInfo.begin()->second;
-        inputInfoFirst->setInputPrecision(Precision::U8);
+        inputInfoFirst->setPrecision(Precision::U8);
 
         if (FLAGS_auto_resize) {
             inputInfoFirst->getPreProcess().setResizeAlgorithm(ResizeAlgorithm::RESIZE_BILINEAR);
@@ -185,8 +188,8 @@ struct PersonDetection : BaseDetection{
         // -----------------------------------------------------------------------------------------------------
 
         // ---------------------------Check outputs ------------------------------------------------------
-        std::cout << "[ INFO ] Checking Person Detection outputs" << std::endl;
-        OutputsDataMap outputInfo(netReader.getNetwork().getOutputsInfo());
+        slog::info << "Checking Person Detection outputs" << slog::endl;
+        OutputsDataMap outputInfo(network.getOutputsInfo());
         if (outputInfo.size() != 1) {
             throw std::logic_error("Person Detection network should have only one output");
         }
@@ -204,8 +207,8 @@ struct PersonDetection : BaseDetection{
         _output->setPrecision(Precision::FP32);
         _output->setLayout(Layout::NCHW);
 
-        std::cout << "[ INFO ] Loading Person Detection model to the "<< FLAGS_d << " plugin" << std::endl;
-        return netReader.getNetwork();
+        slog::info << "Loading Person Detection model to the "<< FLAGS_d << " device" << slog::endl;
+        return network;
     }
 
     void fetchResults() {
@@ -213,7 +216,8 @@ struct PersonDetection : BaseDetection{
         results.clear();
         if (resultsFetched) return;
         resultsFetched = true;
-        const float *detections = request.GetBlob(outputName)->buffer().as<float *>();
+        LockedMemory<const void> outputMapped = as<MemoryBlob>(request.GetBlob(outputName))->rmap();
+        const float *detections = outputMapped.as<float *>();
         // pretty much regular SSD post-processing
         for (int i = 0; i < maxProposalCount; i++) {
             float image_id = detections[i * objectSize + 0];  // in case of batch
@@ -225,10 +229,10 @@ struct PersonDetection : BaseDetection{
             r.label = static_cast<int>(detections[i * objectSize + 1]);
             r.confidence = detections[i * objectSize + 2];
 
-            r.location.x = detections[i * objectSize + 3] * width;
-            r.location.y = detections[i * objectSize + 4] * height;
-            r.location.width = detections[i * objectSize + 5] * width - r.location.x;
-            r.location.height = detections[i * objectSize + 6] * height - r.location.y;
+            r.location.x = static_cast<int>(detections[i * objectSize + 3] * width);
+            r.location.y = static_cast<int>(detections[i * objectSize + 4] * height);
+            r.location.width = static_cast<int>(detections[i * objectSize + 5] * width - r.location.x);
+            r.location.height = static_cast<int>(detections[i * objectSize + 6] * height - r.location.y);
 
             if (FLAGS_r) {
                 std::cout << "[" << i << "," << r.label << "] element, prob = " << r.confidence <<
@@ -249,13 +253,15 @@ struct PersonAttribsDetection : BaseDetection {
     std::string outputNameForAttributes;
     std::string outputNameForTopColorPoint;
     std::string outputNameForBottomColorPoint;
+    bool hasTopBottomColor;
 
 
-    PersonAttribsDetection() : BaseDetection(FLAGS_m_pa, "Person Attributes Recognition") {}
+    PersonAttribsDetection() : BaseDetection(FLAGS_m_pa, "Person Attributes Recognition"), hasTopBottomColor(false) {}
 
     struct AttributesAndColorPoints{
         std::vector<std::string> attributes_strings;
         std::vector<bool> attributes_indicators;
+
         cv::Point2f top_color_point;
         cv::Point2f bottom_color_point;
         cv::Vec3b top_color;
@@ -269,92 +275,108 @@ struct PersonAttribsDetection : BaseDetection {
         cv::Mat image32f;
         image.convertTo(image32f, CV_32F);
         image32f = image32f.reshape(1, image32f.rows*image32f.cols);
+        clusterCount = std::min(clusterCount, image32f.rows);
         cv::kmeans(image32f, clusterCount, labels, cv::TermCriteria(cv::TermCriteria::EPS+cv::TermCriteria::MAX_ITER, 10, 1.0),
                     10, cv::KMEANS_RANDOM_CENTERS, centers);
         centers.convertTo(centers, CV_8U);
         centers = centers.reshape(0, clusterCount);
-        std::map<int, cv::Vec3b, std::greater<int>> max_color;
         std::vector<int> freq(clusterCount);
 
-        for (size_t i = 0; i < labels.rows * labels.cols; ++i) {
+        for (int i = 0; i < labels.rows * labels.cols; ++i) {
             freq[labels.at<int>(i)]++;
         }
 
-        for (size_t i = 0; i < freq.size(); ++i) {
-            max_color[freq[i]] = centers.at<cv::Vec3b>(i);
-        }
+        int freqArgmax = static_cast<int>(std::max_element(freq.begin(), freq.end()) - freq.begin());
 
-        return max_color.begin()->second;
+        return centers.at<cv::Vec3b>(freqArgmax);
     }
 
     AttributesAndColorPoints GetPersonAttributes() {
-        static const std::vector<std::string> attributesVec = {
+        static const char *const attributeStringsFor7Attributes[] = {
+                "is male", "has_bag", "has hat", "has longsleeves", "has longpants", "has longhair", "has coat_jacket"
+        };
+        static const char *const attributeStringsFor8Attributes[] = {
                 "is male", "has_bag", "has_backpack" , "has hat", "has longsleeves", "has longpants", "has longhair", "has coat_jacket"
         };
 
         Blob::Ptr attribsBlob = request.GetBlob(outputNameForAttributes);
-        Blob::Ptr topColorPointBlob = request.GetBlob(outputNameForTopColorPoint);
-        Blob::Ptr bottomColorPointBlob = request.GetBlob(outputNameForBottomColorPoint);
-        int numOfAttrChannels = attribsBlob->getTensorDesc().getDims().at(1);
-        int numOfTCPointChannels = topColorPointBlob->getTensorDesc().getDims().at(1);
-        int numOfBCPointChannels = bottomColorPointBlob->getTensorDesc().getDims().at(1);
+        size_t numOfAttrChannels = attribsBlob->getTensorDesc().getDims().at(1);
 
-        if (numOfAttrChannels != attributesVec.size()) {
+        const char *const *attributeStrings;
+        if (numOfAttrChannels == arraySize(attributeStringsFor7Attributes)) {
+            attributeStrings = attributeStringsFor7Attributes;
+        } else if (numOfAttrChannels == arraySize(attributeStringsFor8Attributes)) {
+            attributeStrings = attributeStringsFor8Attributes;
+        } else {
             throw std::logic_error("Output size (" + std::to_string(numOfAttrChannels) + ") of the "
-                                   "Person Attributes Recognition network is not equal to used person "
-                                   "attributes vector size (" + std::to_string(attributesVec.size()) + ")");
+                                   "Person Attributes Recognition network is not equal to expected "
+                                   "number of attributes ("
+                                   + std::to_string(arraySize(attributeStringsFor7Attributes))
+                                   + " or "
+                                   + std::to_string(arraySize(attributeStringsFor7Attributes)) + ")");
         }
-        if (numOfTCPointChannels != 2) {
-            throw std::logic_error("Output size (" + std::to_string(numOfTCPointChannels) + ") of the "
-                                   "Person Attributes Recognition network is not equal to point coordinates(2)");
-        }
-        if (numOfBCPointChannels != 2) {
-            throw std::logic_error("Output size (" + std::to_string(numOfBCPointChannels) + ") of the "
-                                   "Person Attributes Recognition network is not equal to point coordinates (2)");
-        }
-
-        auto outputAttrValues = attribsBlob->buffer().as<float*>();
-        auto outputTCPointValues = topColorPointBlob->buffer().as<float*>();
-        auto outputBCPointValues = bottomColorPointBlob->buffer().as<float*>();
 
         AttributesAndColorPoints returnValue;
 
-        returnValue.top_color_point.x = outputTCPointValues[0];
-        returnValue.top_color_point.y = outputTCPointValues[1];
-
-        returnValue.bottom_color_point.x = outputBCPointValues[0];
-        returnValue.bottom_color_point.y = outputBCPointValues[1];
-
-        for (int i = 0; i < attributesVec.size(); i++) {
-            returnValue.attributes_strings.push_back(attributesVec[i]);
+        LockedMemory<const void> attribsBlobMapped = as<MemoryBlob>(attribsBlob)->rmap();
+        auto outputAttrValues = attribsBlobMapped.as<float*>();
+        for (size_t i = 0; i < numOfAttrChannels; i++) {
+            returnValue.attributes_strings.push_back(attributeStrings[i]);
             returnValue.attributes_indicators.push_back(outputAttrValues[i] > 0.5);
+        }
+
+        if (hasTopBottomColor) {
+            Blob::Ptr topColorPointBlob = request.GetBlob(outputNameForTopColorPoint);
+            Blob::Ptr bottomColorPointBlob = request.GetBlob(outputNameForBottomColorPoint);
+
+            size_t numOfTCPointChannels = topColorPointBlob->getTensorDesc().getDims().at(1);
+            size_t numOfBCPointChannels = bottomColorPointBlob->getTensorDesc().getDims().at(1);
+            if (numOfTCPointChannels != 2) {
+                throw std::logic_error("Output size (" + std::to_string(numOfTCPointChannels) + ") of the "
+                                       "Person Attributes Recognition network is not equal to point coordinates(2)");
+            }
+            if (numOfBCPointChannels != 2) {
+                throw std::logic_error("Output size (" + std::to_string(numOfBCPointChannels) + ") of the "
+                                       "Person Attributes Recognition network is not equal to point coordinates (2)");
+            }
+
+            LockedMemory<const void> topColorPointBlobMapped = as<MemoryBlob>(topColorPointBlob)->rmap();
+            auto outputTCPointValues = topColorPointBlobMapped.as<float*>();
+            LockedMemory<const void> bottomColorPointBlobMapped = as<MemoryBlob>(bottomColorPointBlob)->rmap();
+            auto outputBCPointValues = bottomColorPointBlobMapped.as<float*>();
+
+            returnValue.top_color_point.x = outputTCPointValues[0];
+            returnValue.top_color_point.y = outputTCPointValues[1];
+
+            returnValue.bottom_color_point.x = outputBCPointValues[0];
+            returnValue.bottom_color_point.y = outputBCPointValues[1];
         }
 
         return returnValue;
     }
 
-    CNNNetwork read() override {
-        std::cout << "[ INFO ] Loading network files for PersonAttribs" << std::endl;
-        CNNNetReader netReader;
-        /** Read network model **/
-        netReader.ReadNetwork(FLAGS_m_pa);
-        netReader.getNetwork().setBatchSize(1);
-        std::cout << "[ INFO ] Batch size is forced to 1 for Person Attribs" << std::endl;
+    bool HasTopBottomColor() const {
+        return hasTopBottomColor;
+    }
 
+    CNNNetwork read(const Core& ie) override {
+        slog::info << "Loading network files for PersonAttribs" << slog::endl;
+        /** Read network model **/
+        auto network = ie.ReadNetwork(FLAGS_m_pa);
         /** Extract model name and load it's weights **/
-        std::string binFileName = fileNameNoExt(FLAGS_m_pa) + ".bin";
-        netReader.ReadWeights(binFileName);
+        network.setBatchSize(1);
+        slog::info << "Batch size is forced to 1 for Person Attribs" << slog::endl;
         // -----------------------------------------------------------------------------------------------------
 
         /** Person Attribs network should have one input two outputs **/
         // ---------------------------Check inputs ------------------------------------------------------
-        std::cout << "[ INFO ] Checking PersonAttribs inputs" << std::endl;
-        InputsDataMap inputInfo(netReader.getNetwork().getInputsInfo());
+        slog::info << "Checking PersonAttribs inputs" << slog::endl;
+        InputsDataMap inputInfo(network.getInputsInfo());
         if (inputInfo.size() != 1) {
             throw std::logic_error("Person Attribs topology should have only one input");
         }
         InputInfo::Ptr& inputInfoFirst = inputInfo.begin()->second;
-        inputInfoFirst->setInputPrecision(Precision::U8);
+        inputInfoFirst->setPrecision(Precision::U8);
         if (FLAGS_auto_resize) {
             inputInfoFirst->getPreProcess().setResizeAlgorithm(ResizeAlgorithm::RESIZE_BILINEAR);
             inputInfoFirst->getInputData()->setLayout(Layout::NHWC);
@@ -365,18 +387,24 @@ struct PersonAttribsDetection : BaseDetection {
         // -----------------------------------------------------------------------------------------------------
 
         // ---------------------------Check outputs ------------------------------------------------------
-        std::cout << "[ INFO ] Checking Person Attribs outputs" << std::endl;
-        OutputsDataMap outputInfo(netReader.getNetwork().getOutputsInfo());
-        if (outputInfo.size() != 3) {
-             throw std::logic_error("Person Attribs Network expects networks having one output");
+        slog::info << "Checking Person Attribs outputs" << slog::endl;
+        OutputsDataMap outputInfo(network.getOutputsInfo());
+        if ((outputInfo.size() != 1) && (outputInfo.size() != 3)) {
+             throw std::logic_error("Person Attribs Network expects either a network having one output (person attributes), "
+                                    "or a network having three outputs (person attributes, top color point, bottom color point)");
         }
         auto it = outputInfo.begin();
-        outputNameForAttributes = (it++)->second->name;  // attribute probabilities
-        outputNameForTopColorPoint = (it++)->second->name;  // top color location
-        outputNameForBottomColorPoint = (it++)->second->name;  // bottom color location
-        std::cout << "[ INFO ] Loading Person Attributes Recognition model to the "<< FLAGS_d_pa << " plugin" << std::endl;
+        outputNameForAttributes = (it++)->second->getName();  // attribute probabilities
+        if (outputInfo.size() == 3) {
+            outputNameForTopColorPoint = (it++)->second->getName();  // top color location
+            outputNameForBottomColorPoint = (it++)->second->getName();  // bottom color location
+            hasTopBottomColor = true;
+        } else {
+            hasTopBottomColor = false;
+        }
+        slog::info << "Loading Person Attributes Recognition model to the "<< FLAGS_d_pa << " device" << slog::endl;
         _enabled = true;
-        return netReader.getNetwork();
+        return network;
     }
 };
 
@@ -386,12 +414,11 @@ struct PersonReIdentification : BaseDetection {
     PersonReIdentification() : BaseDetection(FLAGS_m_reid, "Person Reidentification Retail") {}
 
     unsigned long int findMatchingPerson(const std::vector<float> &newReIdVec) {
-        float cosSim;
         auto size = globalReIdVec.size();
 
         /* assigned REID is index of the matched vector from the globalReIdVec */
-        for (auto i = 0; i < size; ++i) {
-            cosSim = cosineSimilarity(newReIdVec, globalReIdVec[i]);
+        for (size_t i = 0; i < size; ++i) {
+            float cosSim = cosineSimilarity(newReIdVec, globalReIdVec[i]);
             if (FLAGS_r) {
                 std::cout << "cosineSimilarity: " << cosSim << std::endl;
             }
@@ -410,14 +437,9 @@ struct PersonReIdentification : BaseDetection {
         Blob::Ptr attribsBlob = request.GetBlob(outputName);
 
         auto numOfChannels = attribsBlob->getTensorDesc().getDims().at(1);
-        /* output descriptor of Person Reidentification Recognition network has size 256 */
-        if (numOfChannels != 256) {
-            throw std::logic_error("Output size (" + std::to_string(numOfChannels) + ") of the "
-                                   "Person Reidentification network is not equal to 256");
-        }
-
-        auto outputValues = attribsBlob->buffer().as<float*>();
-        return std::vector<float>(outputValues, outputValues + 256);
+        LockedMemory<const void> attribsBlobMapped = as<MemoryBlob>(attribsBlob)->rmap();
+        auto outputValues = attribsBlobMapped.as<float*>();
+        return std::vector<float>(outputValues, outputValues + numOfChannels);
     }
 
     template <typename T>
@@ -430,7 +452,7 @@ struct PersonReIdentification : BaseDetection {
 
         T mul, denomA, denomB, A, B;
         mul = denomA = denomB = A = B = 0;
-        for (auto i = 0; i < vecA.size(); ++i) {
+        for (size_t i = 0; i < vecA.size(); ++i) {
             A = vecA[i];
             B = vecB[i];
             mul += A * B;
@@ -444,26 +466,21 @@ struct PersonReIdentification : BaseDetection {
         return mul / (sqrt(denomA) * sqrt(denomB));
     }
 
-    CNNNetwork read() override {
-        std::cout << "[ INFO ] Loading network files for Person Reidentification" << std::endl;
-        CNNNetReader netReader;
+    CNNNetwork read(const Core& ie) override {
+        slog::info << "Loading network files for Person Reidentification" << slog::endl;
         /** Read network model **/
-        netReader.ReadNetwork(FLAGS_m_reid);
-        std::cout << "[ INFO ] Batch size is forced to  1 for Person Reidentification Network" << std::endl;
-        netReader.getNetwork().setBatchSize(1);
-        /** Extract model name and load it's weights **/
-        std::string binFileName = fileNameNoExt(FLAGS_m_reid) + ".bin";
-        netReader.ReadWeights(binFileName);
-
+        auto network = ie.ReadNetwork(FLAGS_m_reid);
+        slog::info << "Batch size is forced to  1 for Person Reidentification Network" << slog::endl;
+        network.setBatchSize(1);
         /** Person Reidentification network should have 1 input and one output **/
         // ---------------------------Check inputs ------------------------------------------------------
-        std::cout << "[ INFO ] Checking Person Reidentification Network input" << std::endl;
-        InputsDataMap inputInfo(netReader.getNetwork().getInputsInfo());
+        slog::info << "Checking Person Reidentification Network input" << slog::endl;
+        InputsDataMap inputInfo(network.getInputsInfo());
         if (inputInfo.size() != 1) {
             throw std::logic_error("Person Reidentification Retail should have 1 input");
         }
         InputInfo::Ptr& inputInfoFirst = inputInfo.begin()->second;
-        inputInfoFirst->setInputPrecision(Precision::U8);
+        inputInfoFirst->setPrecision(Precision::U8);
         if (FLAGS_auto_resize) {
             inputInfoFirst->getPreProcess().setResizeAlgorithm(ResizeAlgorithm::RESIZE_BILINEAR);
             inputInfoFirst->getInputData()->setLayout(Layout::NHWC);
@@ -474,16 +491,16 @@ struct PersonReIdentification : BaseDetection {
         // -----------------------------------------------------------------------------------------------------
 
         // ---------------------------Check outputs ------------------------------------------------------
-        std::cout << "[ INFO ] Checking Person Reidentification Network output" << std::endl;
-        OutputsDataMap outputInfo(netReader.getNetwork().getOutputsInfo());
+        slog::info << "Checking Person Reidentification Network output" << slog::endl;
+        OutputsDataMap outputInfo(network.getOutputsInfo());
         if (outputInfo.size() != 1) {
             throw std::logic_error("Person Reidentification Network should have 1 output");
         }
         outputName = outputInfo.begin()->first;
-        std::cout << "[ INFO ] Loading Person Reidentification Retail model to the "<< FLAGS_d_reid << " plugin" << std::endl;
+        slog::info << "Loading Person Reidentification Retail model to the "<< FLAGS_d_reid << " device" << slog::endl;
 
         _enabled = true;
-        return netReader.getNetwork();
+        return network;
     }
 };
 
@@ -491,10 +508,9 @@ struct Load {
     BaseDetection& detector;
     explicit Load(BaseDetection& detector) : detector(detector) { }
 
-    void into(InferencePlugin & plg) const {
+    void into(Core & ie, const std::string & deviceName) const {
         if (detector.enabled()) {
-            detector.net = plg.LoadNetwork(detector.read(), {});
-            detector.plugin = plg;
+            detector.net = ie.LoadNetwork(detector.read(ie), deviceName);
         }
     }
 };
@@ -504,76 +520,71 @@ struct Load {
 int main(int argc, char *argv[]) {
     try {
         /** This demo covers 3 certain topologies and cannot be generalized **/
-        std::cout << "InferenceEngine: " << GetInferenceEngineVersion() << std::endl;
+        std::cout << "InferenceEngine: " << *GetInferenceEngineVersion() << std::endl;
 
         // ------------------------------ Parsing and validation of input args ---------------------------------
         if (!ParseAndCheckCommandLine(argc, argv)) {
             return 0;
         }
 
-        std::cout << "[ INFO ] Reading input" << std::endl;
-        cv::Mat frame = cv::imread(FLAGS_i, cv::IMREAD_COLOR);
-        const bool isVideo = frame.empty();
-        cv::VideoCapture cap;
-        if (isVideo && !(FLAGS_i == "cam" ? cap.open(0) : cap.open(FLAGS_i))) {
-            throw std::logic_error("Cannot open input file or camera: " + FLAGS_i);
-        }
-        const size_t width  = isVideo ? (size_t) cap.get(cv::CAP_PROP_FRAME_WIDTH) : frame.size().width;
-        const size_t height = isVideo ? (size_t) cap.get(cv::CAP_PROP_FRAME_HEIGHT) : frame.size().height;
+        std::unique_ptr<ImagesCapture> cap = openImagesCapture(FLAGS_i, FLAGS_loop);
         // -----------------------------------------------------------------------------------------------------
 
-        // --------------------------- 1. Load Plugin for inference engine -------------------------------------
-        std::map<std::string, InferencePlugin> pluginsForNetworks;
-        std::vector<std::string> pluginNames = {
-                FLAGS_d, FLAGS_d_pa, FLAGS_d_reid
-        };
+        // --------------------------- 1. Load inference engine -------------------------------------
+        Core ie;
+
+        std::set<std::string> loadedDevices;
 
         PersonDetection personDetection;
         PersonAttribsDetection personAttribs;
         PersonReIdentification personReId;
 
-        for (auto && flag : pluginNames) {
-            if (flag == "") continue;
-            auto i = pluginsForNetworks.find(flag);
-            if (i != pluginsForNetworks.end()) {
+        std::vector<std::string> deviceNames = {
+                FLAGS_d,
+                personAttribs.enabled() ? FLAGS_d_pa : "",
+                personReId.enabled() ? FLAGS_d_reid : ""
+        };
+
+        for (auto && flag : deviceNames) {
+            if (flag.empty())
+                continue;
+
+            auto i = loadedDevices.find(flag);
+            if (i != loadedDevices.end()) {
                 continue;
             }
-            std::cout << "[ INFO ] Loading plugin " << flag << std::endl;
-            InferencePlugin plugin = PluginDispatcher({"../../../lib/intel64", ""}).getPluginByDevice(flag);
+            slog::info << "Loading device " << flag << slog::endl;
 
-            /** Printing plugin version **/
-            printPluginVersion(plugin, std::cout);
+            /** Printing device version **/
+            std::cout << ie.GetVersions(flag) << std::endl;
 
             if ((flag.find("CPU") != std::string::npos)) {
-                /** Load default extensions lib for the CPU plugin (e.g. SSD's DetectionOutput)**/
-                plugin.AddExtension(std::make_shared<Extensions::Cpu::CpuExtensions>());
                 if (!FLAGS_l.empty()) {
                     // CPU(MKLDNN) extensions are loaded as a shared library and passed as a pointer to base extension
                     auto extension_ptr = make_so_pointer<IExtension>(FLAGS_l);
-                    plugin.AddExtension(extension_ptr);
-                    std::cout << "CPU Extension loaded: " << FLAGS_l << std::endl;
+                    ie.AddExtension(extension_ptr, "CPU");
+                    slog::info << "CPU Extension loaded: " << FLAGS_l << slog::endl;
                 }
             }
 
             if ((flag.find("GPU") != std::string::npos) && !FLAGS_c.empty()) {
                 // Load any user-specified clDNN Extensions
-                plugin.SetConfig({ { PluginConfigParams::KEY_CONFIG_FILE, FLAGS_c } });
+                ie.SetConfig({ { PluginConfigParams::KEY_CONFIG_FILE, FLAGS_c } }, "GPU");
             }
-            pluginsForNetworks[flag] = plugin;
+
+            loadedDevices.insert(flag);
         }
 
         /** Per layer metrics **/
         if (FLAGS_pc) {
-            for (auto && plugin : pluginsForNetworks) {
-                plugin.second.SetConfig({{PluginConfigParams::KEY_PERF_COUNT, PluginConfigParams::YES}});
-            }
+            ie.SetConfig({{PluginConfigParams::KEY_PERF_COUNT, PluginConfigParams::YES}});
         }
         // -----------------------------------------------------------------------------------------------------
 
-        // --------------------------- 2. Read IR models and load them to plugins ------------------------------
-        Load(personDetection).into(pluginsForNetworks[FLAGS_d]);
-        Load(personAttribs).into(pluginsForNetworks[FLAGS_d_pa]);
-        Load(personReId).into(pluginsForNetworks[FLAGS_d_reid]);
+        // --------------------------- 2. Read IR models and load them to devices ------------------------------
+        Load(personDetection).into(ie, FLAGS_d);
+        Load(personAttribs).into(ie, FLAGS_d_pa);
+        Load(personReId).into(ie, FLAGS_d_reid);
         // -----------------------------------------------------------------------------------------------------
 
         // --------------------------- 3. Do inference ---------------------------------------------------------
@@ -585,14 +596,23 @@ int main(int argc, char *argv[]) {
         /** Start inference & calc performance **/
         typedef std::chrono::duration<double, std::ratio<1, 1000>> ms;
         auto total_t0 = std::chrono::high_resolution_clock::now();
-        std::cout << "[ INFO ] Start inference " << std::endl;
+        slog::info << "Start inference " << slog::endl;
+
+        cv::Mat frame = cap->read();
+        if (!frame.data) throw std::logic_error("Can't read an image from the input");
+
+        cv::Size graphSize{frame.cols / 4, 60};
+        Presenter presenter(FLAGS_u, frame.rows - graphSize.height - 10, graphSize);
+
+        std::cout << "To close the application, press 'CTRL+C' here";
+        if (!FLAGS_no_show) {
+            std::cout << " or switch to the output window and press ESC key";
+        }
+        std::cout << std::endl;
+
+        bool shouldHandleTopBottomColors = personAttribs.HasTopBottomColor();
+
         do {
-            // get and enqueue the next frame (in case of video)
-            if (isVideo && !cap.read(frame)) {
-                if (frame.empty())
-                    break;  // end of video file
-                throw std::logic_error("Failed to get frame from cv::VideoCapture");
-            }
             if (FLAGS_auto_resize) {
                 // just wrap Mat object with Blob::Ptr without additional memory allocation
                 frameBlob = wrapMat2Blob(frame);
@@ -614,23 +634,20 @@ int main(int argc, char *argv[]) {
             ms personAttribsNetworkTime(0), personReIdNetworktime(0);
             int personAttribsInferred = 0,  personReIdInferred = 0;
             for (auto && result : personDetection.results) {
-                if (result.label == 1) {  // person
+                if (result.label == FLAGS_person_label) {  // person
                     if (FLAGS_auto_resize) {
                         cropRoi.posX = (result.location.x < 0) ? 0 : result.location.x;
                         cropRoi.posY = (result.location.y < 0) ? 0 : result.location.y;
-                        cropRoi.sizeX = std::min((size_t) result.location.width, width - cropRoi.posX);
-                        cropRoi.sizeY = std::min((size_t) result.location.height, height - cropRoi.posY);
+                        cropRoi.sizeX = std::min((size_t) result.location.width, frame.cols - cropRoi.posX);
+                        cropRoi.sizeY = std::min((size_t) result.location.height, frame.rows - cropRoi.posY);
                         roiBlob = make_shared_blob(frameBlob, cropRoi);
                     } else {
                         // To crop ROI manually and allocate required memory (cv::Mat) again
-                        auto clippedRect = result.location & cv::Rect(0, 0, width, height);
+                        auto clippedRect = result.location & cv::Rect(0, 0, frame.cols, frame.rows);
                         person = frame(clippedRect);
                     }
-                    PersonAttribsDetection::AttributesAndColorPoints resPersAttrAndColor;
-                    std::string resPersReid = "";
-                    cv::Point top_color_p;
-                    cv::Point bottom_color_p;
 
+                    PersonAttribsDetection::AttributesAndColorPoints resPersAttrAndColor;
                     if (personAttribs.enabled()) {
                         // --------------------------- Run Person Attributes Recognition -----------------------
                         if (FLAGS_auto_resize) {
@@ -649,36 +666,43 @@ int main(int argc, char *argv[]) {
 
                         resPersAttrAndColor = personAttribs.GetPersonAttributes();
 
-                        top_color_p.x = resPersAttrAndColor.top_color_point.x * person.cols;
-                        top_color_p.y = resPersAttrAndColor.top_color_point.y * person.rows;
+                        if (shouldHandleTopBottomColors) {
+                            cv::Point top_color_p;
+                            cv::Point bottom_color_p;
 
-                        bottom_color_p.x = resPersAttrAndColor.bottom_color_point.x * person.cols;
-                        bottom_color_p.y = resPersAttrAndColor.bottom_color_point.y * person.rows;
+                            top_color_p.x = static_cast<int>(resPersAttrAndColor.top_color_point.x) * person.cols;
+                            top_color_p.y = static_cast<int>(resPersAttrAndColor.top_color_point.y) * person.rows;
+
+                            bottom_color_p.x = static_cast<int>(resPersAttrAndColor.bottom_color_point.x) * person.cols;
+                            bottom_color_p.y = static_cast<int>(resPersAttrAndColor.bottom_color_point.y) * person.rows;
 
 
-                        cv::Rect person_rect(0, 0, person.cols, person.rows);
+                            cv::Rect person_rect(0, 0, person.cols, person.rows);
 
-                        // Define area around top color's location
-                        cv::Rect tc_rect;
-                        tc_rect.x = top_color_p.x - person.cols / 6;
-                        tc_rect.y = top_color_p.y - person.rows / 10;
-                        tc_rect.height = 2 * person.rows / 8;
-                        tc_rect.width = 2 * person.cols / 6;
+                            // Define area around top color's location
+                            cv::Rect tc_rect;
+                            tc_rect.x = top_color_p.x - person.cols / 6;
+                            tc_rect.y = top_color_p.y - person.rows / 10;
+                            tc_rect.height = 2 * person.rows / 8;
+                            tc_rect.width = 2 * person.cols / 6;
 
-                        tc_rect = tc_rect & person_rect;
+                            tc_rect = tc_rect & person_rect;
 
-                        // Define area around bottom color's location
-                        cv::Rect bc_rect;
-                        bc_rect.x = bottom_color_p.x - person.cols / 6;
-                        bc_rect.y = bottom_color_p.y - person.rows / 10;
-                        bc_rect.height =  2 * person.rows / 8;
-                        bc_rect.width = 2 * person.cols / 6;
+                            // Define area around bottom color's location
+                            cv::Rect bc_rect;
+                            bc_rect.x = bottom_color_p.x - person.cols / 6;
+                            bc_rect.y = bottom_color_p.y - person.rows / 10;
+                            bc_rect.height =  2 * person.rows / 8;
+                            bc_rect.width = 2 * person.cols / 6;
 
-                        bc_rect = bc_rect & person_rect;
+                            bc_rect = bc_rect & person_rect;
 
-                        resPersAttrAndColor.top_color = PersonAttribsDetection::GetAvgColor(person(tc_rect));
-                        resPersAttrAndColor.bottom_color = PersonAttribsDetection::GetAvgColor(person(bc_rect));
+                            resPersAttrAndColor.top_color = PersonAttribsDetection::GetAvgColor(person(tc_rect));
+                            resPersAttrAndColor.bottom_color = PersonAttribsDetection::GetAvgColor(person(bc_rect));
+                        }
                     }
+
+                    std::string resPersReid = "";
                     if (personReId.enabled()) {
                         // --------------------------- Run Person Reidentification -----------------------------
                         if (FLAGS_auto_resize) {
@@ -713,8 +737,10 @@ int main(int argc, char *argv[]) {
                         cv::Rect bc_label(result.location.x + result.location.width, result.location.y + result.location.height / 2,
                                             result.location.width / 4, result.location.height / 2);
 
-                        frame(tc_label & image_area) = resPersAttrAndColor.top_color;
-                        frame(bc_label & image_area) = resPersAttrAndColor.bottom_color;
+                        if (shouldHandleTopBottomColors) {
+                            frame(tc_label & image_area) = resPersAttrAndColor.top_color;
+                            frame(bc_label & image_area) = resPersAttrAndColor.bottom_color;
+                        }
 
                         for (size_t i = 0; i < resPersAttrAndColor.attributes_strings.size(); ++i) {
                             cv::Scalar color;
@@ -725,7 +751,8 @@ int main(int argc, char *argv[]) {
                             }
                             cv::putText(frame,
                                     resPersAttrAndColor.attributes_strings[i],
-                                    cv::Point2f(result.location.x + 5 * result.location.width / 4, result.location.y + 15 + 15 * i),
+                                    cv::Point2f(static_cast<float>(result.location.x + 5 * result.location.width / 4),
+                                                static_cast<float>(result.location.y + 15 + 15 * i)),
                                     cv::FONT_HERSHEY_COMPLEX_SMALL,
                                     0.5,
                                     color);
@@ -737,14 +764,16 @@ int main(int argc, char *argv[]) {
                                 if (resPersAttrAndColor.attributes_indicators[i])
                                     output_attribute_string += resPersAttrAndColor.attributes_strings[i] + ",";
                             std::cout << "Person Attributes results: " << output_attribute_string << std::endl;
-                            std::cout << "Person top color: " << resPersAttrAndColor.top_color << std::endl;
-                            std::cout << "Person bottom color: " << resPersAttrAndColor.bottom_color << std::endl;
+                            if (shouldHandleTopBottomColors) {
+                                std::cout << "Person top color: " << resPersAttrAndColor.top_color << std::endl;
+                                std::cout << "Person bottom color: " << resPersAttrAndColor.bottom_color << std::endl;
+                            }
                         }
                     }
                     if (!resPersReid.empty()) {
                         cv::putText(frame,
                                     resPersReid,
-                                    cv::Point2f(result.location.x, result.location.y + 30),
+                                    cv::Point2f(static_cast<float>(result.location.x), static_cast<float>(result.location.y + 30)),
                                     cv::FONT_HERSHEY_COMPLEX_SMALL,
                                     0.6,
                                     cv::Scalar(255, 255, 255));
@@ -757,6 +786,8 @@ int main(int argc, char *argv[]) {
                 }
             }
 
+            presenter.drawGraphs(frame);
+
             // --------------------------- Execution statistics ------------------------------------------------
             std::ostringstream out;
             out << "Person detection time  : " << std::fixed << std::setprecision(2) << detection.count()
@@ -766,7 +797,7 @@ int main(int argc, char *argv[]) {
                         cv::Scalar(255, 0, 0));
             if (personDetection.results.size()) {
                 if (personAttribs.enabled() && personAttribsInferred) {
-                    float average_time = personAttribsNetworkTime.count() / personAttribsInferred;
+                    float average_time = static_cast<float>(personAttribsNetworkTime.count() / personAttribsInferred);
                     out.str("");
                     out << "Person Attributes Recognition time (averaged over " << personAttribsInferred
                         << " detections) :" << std::fixed << std::setprecision(2) << average_time
@@ -778,7 +809,7 @@ int main(int argc, char *argv[]) {
                     }
                 }
                 if (personReId.enabled() && personReIdInferred) {
-                    float average_time = personReIdNetworktime.count() / personReIdInferred;
+                    float average_time = static_cast<float>(personReIdNetworktime.count() / personReIdInferred);
                     out.str("");
                     out << "Person Reidentification time (averaged over " << personReIdInferred
                         << " detections) :" << std::fixed << std::setprecision(2) << average_time
@@ -793,24 +824,36 @@ int main(int argc, char *argv[]) {
 
             if (!FLAGS_no_show) {
                 cv::imshow("Detection results", frame);
+                const int key = cv::waitKey(1);
+                if (27 == key)  // Esc
+                    break;
+                presenter.handleKey(key);
             }
-            // for still images wait until any key is pressed, for video 1 ms is enough per frame
-            const int key = cv::waitKey(isVideo ? 1 : 0);
-            if (27 == key)  // Esc
-                break;
-        } while (isVideo);
+            frame = cap->read();
+        } while (frame.data);
 
         auto total_t1 = std::chrono::high_resolution_clock::now();
         ms total = std::chrono::duration_cast<ms>(total_t1 - total_t0);
-        std::cout << "[ INFO ] Total Inference time: " << total.count() << std::endl;
+        slog::info << "Total Inference time: " << total.count() << slog::endl;
 
         /** Show performace results **/
         if (FLAGS_pc) {
-            for (auto && plugin : pluginsForNetworks) {
-                std::cout << "[ INFO ] Performance counts for " << plugin.first << " plugin";
-                printPerformanceCountsPlugin(plugin.second, std::cout);
+            std::map<std::string, std::string>  mapDevices = getMapFullDevicesNames(ie, deviceNames);
+            std::cout << "Performance counts for person detection: " << std::endl;
+            personDetection.printPerformanceCounts(getFullDeviceName(mapDevices, FLAGS_d));
+
+            if (!FLAGS_m_pa.empty()) {
+                std::cout << "Performance counts for person attributes: " << std::endl;
+                personAttribs.printPerformanceCounts(getFullDeviceName(mapDevices, FLAGS_d_pa));
+            }
+
+            if (!FLAGS_m_reid.empty()) {
+                std::cout << "Performance counts for person re-identification: " << std::endl;
+                personReId.printPerformanceCounts(getFullDeviceName(mapDevices, FLAGS_d_reid));
             }
         }
+
+        std::cout << presenter.reportMeans() << '\n';
         // -----------------------------------------------------------------------------------------------------
     }
     catch (const std::exception& error) {
@@ -822,6 +865,6 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    std::cout << "[ INFO ] Execution successful" << std::endl;
+    slog::info << "Execution successful" << slog::endl;
     return 0;
 }

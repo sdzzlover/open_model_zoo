@@ -1,4 +1,4 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -8,24 +8,15 @@
  * @example mask_rcnn_demo/main.cpp
  */
 #include <gflags/gflags.h>
-#include <functional>
 #include <iostream>
 #include <memory>
 #include <map>
 #include <algorithm>
-#include <fstream>
-#include <random>
 #include <string>
 #include <vector>
-#include <time.h>
-#include <chrono>
-#include <limits>
 #include <iomanip>
 
 #include <inference_engine.hpp>
-#include <ext_list.hpp>
-
-#include <format_reader_ptr.h>
 
 #include <samples/ocv_common.hpp>
 #include <samples/slog.hpp>
@@ -40,14 +31,11 @@ bool ParseAndCheckCommandLine(int argc, char *argv[]) {
     gflags::ParseCommandLineNonHelpFlags(&argc, &argv, true);
     if (FLAGS_h) {
         showUsage();
+        showAvailableDevices();
         return false;
     }
 
     slog::info << "Parsing input parameters" << slog::endl;
-
-    if (FLAGS_ni < 1) {
-        throw std::logic_error("Parameter -ni should be greater than 0 (default: 1)");
-    }
 
     if (FLAGS_i.empty()) {
         throw std::logic_error("Parameter -i is not set");
@@ -62,7 +50,7 @@ bool ParseAndCheckCommandLine(int argc, char *argv[]) {
 
 int main(int argc, char *argv[]) {
     try {
-        std::cout << "InferenceEngine: " << InferenceEngine::GetInferenceEngineVersion() << std::endl;
+        std::cout << "InferenceEngine: " << *InferenceEngine::GetInferenceEngineVersion() << std::endl;
 
         // ------------------------------ Parsing and validation of input args ---------------------------------
         if (!ParseAndCheckCommandLine(argc, argv)) {
@@ -70,58 +58,38 @@ int main(int argc, char *argv[]) {
         }
 
         /** This vector stores paths to the processed images **/
-        std::vector<std::string> images;
-        parseInputFilesArguments(images);
-        if (images.empty()) throw std::logic_error("No suitable images were found");
-        if (images.size() > 1) throw std::logic_error("The topology support only one input image");
+        std::vector<std::string> imagePaths;
+        parseInputFilesArguments(imagePaths);
+        if (imagePaths.empty()) throw std::logic_error("No suitable images were found");
         // -----------------------------------------------------------------------------------------------------
 
-        // ---------------------Load plugin for inference engine------------------------------------------------
-        slog::info << "Loading plugin" << slog::endl;
-        InferencePlugin plugin = PluginDispatcher({ FLAGS_pp, "../../../lib/intel64" , "" }).getPluginByDevice(FLAGS_d);
-
-        /** Loading default extensions **/
-        if (FLAGS_d.find("CPU") != std::string::npos) {
-            /**
-             * cpu_extensions library is compiled from "extension" folder containing
-             * custom MKLDNNPlugin layer implementations. These layers are not supported
-             * by mkldnn, but they can be useful for inferring custom topologies.
-            **/
-            plugin.AddExtension(std::make_shared<Extensions::Cpu::CpuExtensions>());
-        }
+        // ---------------------Load inference engine------------------------------------------------
+        slog::info << "Loading Inference Engine" << slog::endl;
+        Core ie;
 
         if (!FLAGS_l.empty()) {
             // CPU(MKLDNN) extensions are loaded as a shared library and passed as a pointer to base extension
             auto extension_ptr = make_so_pointer<InferenceEngine::IExtension>(FLAGS_l);
-            plugin.AddExtension(extension_ptr);
+            ie.AddExtension(extension_ptr, "CPU");
             slog::info << "CPU Extension loaded: " << FLAGS_l << slog::endl;
         }
         if (!FLAGS_c.empty()) {
             // clDNN Extensions are loaded from an .xml description and OpenCL kernel files
-            plugin.SetConfig({{PluginConfigParams::KEY_CONFIG_FILE, FLAGS_c}});
+            ie.SetConfig({{PluginConfigParams::KEY_CONFIG_FILE, FLAGS_c}}, "CPU");
             slog::info << "GPU Extension loaded: " << FLAGS_c << slog::endl;
         }
 
-        /** Setting plugin parameter for per layer metrics **/
-        if (FLAGS_pc) {
-            plugin.SetConfig({ { PluginConfigParams::KEY_PERF_COUNT, PluginConfigParams::YES } });
-        }
-        /** Printing plugin version **/
-        printPluginVersion(plugin, std::cout);
+        /** Printing version **/
+        slog::info << "Device info: " << slog::endl;
+        std::cout << ie.GetVersions(FLAGS_d);
 
         // -----------------------------------------------------------------------------------------------------
 
         // --------------------Load network (Generated xml/bin files)-------------------------------------------
         slog::info << "Loading network files" << slog::endl;
 
-        InferenceEngine::CNNNetReader networkReader;
         /** Read network model **/
-        networkReader.ReadNetwork(FLAGS_m);
-
-        /** Extract model name and load weights **/
-        std::string binFileName = fileNameNoExt(FLAGS_m) + ".bin";
-        networkReader.ReadWeights(binFileName);
-        auto network = networkReader.getNetwork();
+        auto network = ie.ReadNetwork(FLAGS_m);
 
         // add DetectionOutput layer as output so we can get detected boxes and their probabilities
         network.addOutput(FLAGS_detection_output_name.c_str(), 0);
@@ -132,35 +100,56 @@ int main(int argc, char *argv[]) {
 
         /** Taking information about all topology inputs **/
         InputsDataMap inputInfo(network.getInputsInfo());
-        /** Stores all input blobs data **/
-        InferenceEngine::BlobMap inputBlobs;
 
-        if (inputInfo.size() != 1) throw std::logic_error("Demo supports topologies only with 1 input");
-        auto inputInfoItem = *inputInfo.begin();
+        std::string imageInputName;
 
-        /** Collect images data ptrs **/
-        std::vector<std::shared_ptr<unsigned char>> imagesData;
-        std::vector<cv::Mat> images_cv;
-        for (auto & i : images) {
-            images_cv.push_back(cv::imread(i, cv::IMREAD_COLOR));
-            FormatReader::ReaderPtr reader(i.c_str());
-            if (reader.get() == nullptr) {
-                slog::warn << "Image " + i + " cannot be read!" << slog::endl;
-                continue;
-            }
-            /** Getting image data **/
-            std::shared_ptr<unsigned char> data(reader->getData(inputInfoItem.second->getDims()[0], inputInfoItem.second->getDims()[1]));
-            if (data.get() != nullptr) {
-                imagesData.push_back(data);
+        for (const auto & inputInfoItem : inputInfo) {
+            if (inputInfoItem.second->getTensorDesc().getDims().size() == 4) {  // first input contains images
+                imageInputName = inputInfoItem.first;
+                inputInfoItem.second->setPrecision(Precision::U8);
+            } else if (inputInfoItem.second->getTensorDesc().getDims().size() == 2) {  // second input contains image info
+                inputInfoItem.second->setPrecision(Precision::FP32);
+            } else {
+                throw std::logic_error("Unsupported input shape with size = " + std::to_string(inputInfoItem.second->getTensorDesc().getDims().size()));
             }
         }
-        if (imagesData.empty()) throw std::logic_error("Valid input images were not found!");
 
-        /** Setting batch size to 1 since it is the only supported batch **/
-        network.setBatchSize(1);
-        slog::info << "Batch size is " << std::to_string(networkReader.getNetwork().getBatchSize()) << slog::endl;
+        /** network dimensions for image input **/
+        const TensorDesc& inputDesc = inputInfo[imageInputName]->getTensorDesc();
+        IE_ASSERT(inputDesc.getDims().size() == 4);
+        size_t netBatchSize = getTensorBatch(inputDesc);
+        size_t netInputHeight = getTensorHeight(inputDesc);
+        size_t netInputWidth = getTensorWidth(inputDesc);
 
-        inputInfoItem.second->setPrecision(Precision::U8);
+        slog::info << "Network batch size is " << netBatchSize << slog::endl;
+
+        /** Collect images **/
+        std::vector<cv::Mat> images;
+
+        if (netBatchSize > imagePaths.size()) {
+            slog::warn << "Network batch size is greater than number of images (" << imagePaths.size() <<
+                       "), some input files will be duplicated" << slog::endl;
+        } else if (netBatchSize < imagePaths.size()) {
+            slog::warn << "Network batch size is less than number of images (" << imagePaths.size() <<
+                       "), some input files will be ignored" << slog::endl;
+        }
+
+        for (size_t i = 0, inputIndex = 0; i < netBatchSize; i++, inputIndex++) {
+            if (inputIndex >= imagePaths.size()) {
+                inputIndex = 0;
+            }
+            slog::info << "Prepare image " << imagePaths[inputIndex] << slog::endl;
+
+            cv::Mat image = cv::imread(imagePaths[inputIndex], cv::IMREAD_COLOR);
+
+            if (image.empty()) {
+                slog::warn << "Image " + imagePaths[inputIndex] + " cannot be read!" << slog::endl;
+                continue;
+            }
+
+            images.push_back(image);
+        }
+        if (images.empty()) throw std::logic_error("Valid input images were not found!");
 
         // -----------------------------------------------------------------------------------------------------
 
@@ -171,160 +160,129 @@ int main(int argc, char *argv[]) {
         for (auto & item : outputInfo) {
             item.second->setPrecision(Precision::FP32);
         }
+
         // -----------------------------------------------------------------------------------------------------
 
-        // -------------------------Load model to the plugin-------------------------------------------------
-        slog::info << "Loading model to the plugin" << slog::endl;
+        // -------------------------Load model to the device----------------------------------------------------
+        slog::info << "Loading model to the device" << slog::endl;
+        auto executable_network = ie.LoadNetwork(network, FLAGS_d);
 
-        auto executable_network = plugin.LoadNetwork(network, {});
+        // -------------------------Create Infer Request--------------------------------------------------------
+        slog::info << "Create infer request" << slog::endl;
         auto infer_request = executable_network.CreateInferRequest();
 
         // -----------------------------------------------------------------------------------------------------
 
-        // -------------------------------Set input data----------------------------------------------------
+        // -------------------------------Set input data--------------------------------------------------------
+        slog::info << "Setting input data to the blobs" << slog::endl;
+
         /** Iterate over all the input blobs **/
-        /** Iterating over all input blobs **/
-        for (const auto & item : inputInfo) {
-            /** Creating input blob **/
-            Blob::Ptr input = infer_request.GetBlob(item.first);
+        for (const auto & inputInfoItem : inputInfo) {
+            Blob::Ptr input = infer_request.GetBlob(inputInfoItem.first);
 
-            /** Fill input tensor with images. First b channel, then g and r channels **/
-            size_t num_channels = input->dims()[2];
-            size_t image_size = input->dims()[1] * input->dims()[0];
+            /** Fill first input tensor with images. First b channel, then g and r channels **/
+            if (inputInfoItem.second->getTensorDesc().getDims().size() == 4) {
+                /** Iterate over all input images **/
+                for (size_t image_id = 0; image_id < images.size(); ++image_id)
+                    matU8ToBlob<unsigned char>(images[image_id], input, image_id);
+            }
 
-            auto data = input->buffer().as<PrecisionTrait<Precision::U8>::value_type*>();
-
-            /** Iterate over all input images **/
-            for (size_t image_id = 0; image_id < imagesData.size(); ++image_id) {
-                /** Iterate over all pixel in image (b,g,r) **/
-                for (size_t pid = 0; pid < image_size; pid++) {
-                    /** Iterate over all channels **/
-                    for (size_t ch = 0; ch < num_channels; ++ch) {
-                        /**          [images stride + channels stride + pixel id ] all in bytes            **/
-                        data[image_id * image_size * num_channels + ch * image_size + pid] = imagesData.at(image_id).get()[pid*num_channels + ch];
-                    }
-                }
+            /** Fill second input tensor with image info **/
+            if (inputInfoItem.second->getTensorDesc().getDims().size() == 2) {
+                LockedMemory<void> inputMapped = as<MemoryBlob>(input)->wmap();
+                auto data = inputMapped.as<float *>();
+                data[0] = static_cast<float>(netInputHeight);  // height
+                data[1] = static_cast<float>(netInputWidth);  // width
+                data[2] = 1;
             }
         }
+
         // -----------------------------------------------------------------------------------------------------
 
 
         // ----------------------------Do inference-------------------------------------------------------------
-        slog::info << "Start inference (" << FLAGS_ni << " iterations)" << slog::endl;
-
-        typedef std::chrono::high_resolution_clock Time;
-        typedef std::chrono::duration<double, std::ratio<1, 1000>> ms;
-        typedef std::chrono::duration<float> fsec;
-
-        double total = 0.0;
-        /** Start inference & calc performance **/
-        for (int iter = 0; iter < FLAGS_ni; ++iter) {
-            auto t0 = Time::now();
-            infer_request.Infer();
-            auto t1 = Time::now();
-            fsec fs = t1 - t0;
-            ms d = std::chrono::duration_cast<ms>(fs);
-            total += d.count();
-        }
-
-        /** Show performance results **/
-        std::cout << std::endl << "Average running time of one iteration: " << total / static_cast<double>(FLAGS_ni) << " ms" << std::endl << std::endl;
-
-        if (FLAGS_pc) {
-            printPerformanceCounts(infer_request, std::cout);
-        }
+        slog::info << "Start inference" << slog::endl;
+        infer_request.Infer();
         // -----------------------------------------------------------------------------------------------------
 
         // ---------------------------Postprocess output blobs--------------------------------------------------
         slog::info << "Processing output blobs" << slog::endl;
 
         const auto do_blob = infer_request.GetBlob(FLAGS_detection_output_name.c_str());
-        const auto do_data = do_blob->buffer().as<float*>();
+        LockedMemory<const void> doBlobMapped = as<MemoryBlob>(do_blob)->rmap();
+        const auto do_data  = doBlobMapped.as<float*>();
 
         const auto masks_blob = infer_request.GetBlob(FLAGS_masks_name.c_str());
-        const auto masks_data = masks_blob->buffer().as<float*>();
+        LockedMemory<const void> masksBlobMapped = as<MemoryBlob>(masks_blob)->rmap();
+        const auto masks_data = masksBlobMapped.as<float*>();
 
-        const float PROBABILITY_THRESHOLD = 0.2;
-        const float MASK_THRESHOLD = 0.5;  // threshold used to determine whever mask pixel corresponds to object or to background
-        size_t BOX_DESCRIPTION_SIZE = do_blob->dims().at(0);  // amount of elements in each detected box description (batch, label, prob, x1, y1, x2, y2)
-        size_t BOXES = masks_blob->dims().at(3);
-        size_t C = masks_blob->dims().at(2);
-        size_t H = masks_blob->dims().at(1);
-        size_t W = masks_blob->dims().at(0);
+        const float PROBABILITY_THRESHOLD = 0.2f;
+        const float MASK_THRESHOLD = 0.5f;  // threshold used to determine whether mask pixel corresponds to object or to background
+        // amount of elements in each detected box description (batch, label, prob, x1, y1, x2, y2)
+        IE_ASSERT(do_blob->getTensorDesc().getDims().size() == 2);
+        size_t BOX_DESCRIPTION_SIZE = do_blob->getTensorDesc().getDims().back();
+
+        const TensorDesc& masksDesc = masks_blob->getTensorDesc();
+        IE_ASSERT(masksDesc.getDims().size() == 4);
+        size_t BOXES = getTensorBatch(masksDesc);
+        size_t C = getTensorChannels(masksDesc);
+        size_t H = getTensorHeight(masksDesc);
+        size_t W = getTensorWidth(masksDesc);
+
 
         size_t box_stride = W * H * C;
 
-        // some colours
-        std::vector<std::vector<short>> colors = {
-            {128, 64,  128},
-            {232, 35,  244},
-            {70,  70,  70},
-            {156, 102, 102},
-            {153, 153, 190},
-            {153, 153, 153},
-            {30,  170, 250},
-            {0,   220, 220},
-            {35,  142, 107},
-            {152, 251, 152},
-            {180, 130, 70},
-            {60,  20,  220},
-            {0,   0,   255},
-            {142, 0,   0},
-            {70,  0,   0},
-            {100, 60,  0},
-            {90,  0,   0},
-            {230, 0,   0},
-            {32,  11,  119},
-            {0,   74,  111},
-            {81,  0,   81}
-        };
-        std::map<int, int> class_color;
+        std::map<size_t, size_t> class_color;
 
-        cv::Mat output_image = images_cv[0].clone();
+        std::vector<cv::Mat> output_images;
+        for (const auto &img : images) {
+            output_images.push_back(img.clone());
+        }
+
         /** Iterating over all boxes **/
         for (size_t box = 0; box < BOXES; ++box) {
             float* box_info = do_data + box * BOX_DESCRIPTION_SIZE;
-            float batch = box_info[0];
+            auto batch = static_cast<int>(box_info[0]);
             if (batch < 0)
                 break;
+            if (batch >= static_cast<int>(netBatchSize))
+                throw std::logic_error("Invalid batch ID within detection output box");
             float prob = box_info[2];
-            float x1 = std::min(std::max(0.0f, box_info[3] * images_cv[0].size().width), static_cast<float>(images_cv[0].size().width));
-            float y1 = std::min(std::max(0.0f, box_info[4] * images_cv[0].size().height), static_cast<float>(images_cv[0].size().height));
-            float x2 = std::min(std::max(0.0f, box_info[5] * images_cv[0].size().width), static_cast<float>(images_cv[0].size().width));
-            float y2 = std::min(std::max(0.0f, box_info[6] * images_cv[0].size().height), static_cast<float>(images_cv[0].size().height));
-            int box_width = std::min(static_cast<int>(std::max(0.0f, x2 - x1)), images_cv[0].size().width);
-            int box_height = std::min(static_cast<int>(std::max(0.0f, y2 - y1)), images_cv[0].size().height);
-            int class_id = static_cast<int>(box_info[1] + 1e-6f);
+            float x1 = std::min(std::max(0.0f, box_info[3] * images[batch].cols), static_cast<float>(images[batch].cols));
+            float y1 = std::min(std::max(0.0f, box_info[4] * images[batch].rows), static_cast<float>(images[batch].rows));
+            float x2 = std::min(std::max(0.0f, box_info[5] * images[batch].cols), static_cast<float>(images[batch].cols));
+            float y2 = std::min(std::max(0.0f, box_info[6] * images[batch].rows), static_cast<float>(images[batch].rows));
+            int box_width = std::min(static_cast<int>(std::max(0.0f, x2 - x1)), images[batch].cols);
+            int box_height = std::min(static_cast<int>(std::max(0.0f, y2 - y1)), images[batch].rows);
+            auto class_id = static_cast<size_t>(box_info[1] + 1e-6f);
             if (prob > PROBABILITY_THRESHOLD) {
-                if (class_color.find(class_id) == class_color.end())
-                    class_color[class_id] = class_color.size();
-                auto& color = colors[class_color[class_id]];
+                size_t color_index = class_color.emplace(class_id, class_color.size()).first->second;
+                auto& color = CITYSCAPES_COLORS[color_index % arraySize(CITYSCAPES_COLORS)];
                 float* mask_arr = masks_data + box_stride * box + H * W * (class_id - 1);
-                slog::info << "Detected class " << class_id << " with probability " << prob << ": [" << x1
-                           << ", " << y1 << "], [" << x2 << ", " << y2 << "]" << slog::endl;
+                slog::info << "Detected class " << class_id << " with probability " << prob << " from batch " << batch
+                           << ": [" << x1 << ", " << y1 << "], [" << x2 << ", " << y2 << "]" << slog::endl;
                 cv::Mat mask_mat(H, W, CV_32FC1, mask_arr);
 
                 cv::Rect roi = cv::Rect(static_cast<int>(x1), static_cast<int>(y1), box_width, box_height);
-                cv::Mat roi_input_img = output_image(roi);
+                cv::Mat roi_input_img = output_images[batch](roi);
                 const float alpha = 0.7f;
 
                 cv::Mat resized_mask_mat(box_height, box_width, CV_32FC1);
                 cv::resize(mask_mat, resized_mask_mat, cv::Size(box_width, box_height));
 
-                cv::Mat uchar_resized_mask(box_height, box_width, images_cv[0].type());
-
-                for (int h = 0; h < resized_mask_mat.size().height; ++h)
-                    for (int w = 0; w < resized_mask_mat.size().width; ++w)
-                        for (int ch = 0; ch < uchar_resized_mask.channels(); ++ch)
-                            uchar_resized_mask.at<cv::Vec3b>(h, w)[ch] = resized_mask_mat.at<float>(h, w) > MASK_THRESHOLD ?
-                                                                            255 * color[ch]: roi_input_img.at<cv::Vec3b>(h, w)[ch];
+                cv::Mat uchar_resized_mask(box_height, box_width, CV_8UC3,
+                    cv::Scalar(color.blue(), color.green(), color.red()));
+                roi_input_img.copyTo(uchar_resized_mask, resized_mask_mat <= MASK_THRESHOLD);
 
                 cv::addWeighted(uchar_resized_mask, alpha, roi_input_img, 1.0f - alpha, 0.0f, roi_input_img);
-                cv::rectangle(output_image, roi, cv::Scalar(0, 0, 1), 1);
+                cv::rectangle(output_images[batch], roi, cv::Scalar(0, 0, 1), 1);
             }
         }
-        cv::imwrite("out.png", output_image);
-        slog::info << "Image out.png created!" << slog::endl;
+        for (size_t i = 0; i < output_images.size(); i++) {
+            std::string imgName = "out" + std::to_string(i) + ".png";
+            cv::imwrite(imgName, output_images[i]);
+            slog::info << "Image " << imgName << " created!" << slog::endl;
+        }
         // -----------------------------------------------------------------------------------------------------
     }
     catch (const std::exception& error) {
@@ -337,5 +295,7 @@ int main(int argc, char *argv[]) {
     }
 
     slog::info << "Execution successful" << slog::endl;
+    slog::info << slog::endl << "This demo is an API example, for any performance measurements "
+                                "please use the dedicated benchmark_app tool from the openVINO toolkit" << slog::endl;
     return 0;
 }

@@ -1,0 +1,31 @@
+# progress bar
+tqdm
+
+# image reading and preprocessing
+scikit-image
+
+# reid
+scikit-learn
+
+# cpu extension usage
+py-cpuinfo!=5.0,!=6.0
+
+# text detection
+shapely
+
+# brain tumor segmentation
+nibabel
+scipy
+
+# dicom images reading
+pydicom
+
+# nlp, tokenization
+sentencepiece
+tokenizers
+
+# editdistance calculation
+editdistance
+
+# speech recognition with language modeling
+pypi-kenlm

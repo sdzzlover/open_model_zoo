@@ -1,4 +1,4 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -10,11 +10,7 @@
 #include <memory>
 #include <vector>
 
-
-#include <ie_plugin_ptr.hpp>
 #include <inference_engine.hpp>
-
-
 
 ///
 /// \brief The IDescriptorDistance class declares an interface for distance

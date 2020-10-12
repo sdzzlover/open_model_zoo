@@ -1,12 +1,12 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
 #pragma once
 
 #include <vector>
+#include <string>
 #include <memory>
-#include <ie_plugin_ptr.hpp>
 #include <inference_engine.hpp>
 
 #include "opencv2/core/core.hpp"
@@ -46,7 +46,7 @@ public:
     ///
     /// \brief Prints performance counts for CNN-based descriptors
     ///
-    virtual void PrintPerformanceCounts() const {}
+    virtual void PrintPerformanceCounts(std::string fullDeviceName) const {}
 
     virtual ~IImageDescriptor() {}
 };
@@ -112,9 +112,10 @@ private:
     VectorCNN handler;
 
 public:
-    explicit DescriptorIE(const CnnConfig& config,
-                          const InferenceEngine::InferencePlugin& plugin):
-        handler(config, plugin) {}
+    DescriptorIE(const CnnConfig& config,
+                 const InferenceEngine::Core& ie,
+                 const std::string & deviceName):
+        handler(config, ie, deviceName) {}
 
     ///
     /// \brief Descriptor size getter.
@@ -143,8 +144,8 @@ public:
         handler.Compute(mats, descrs);
     }
 
-    virtual void PrintPerformanceCounts() const {
-        handler.PrintPerformanceCounts();
+    virtual void PrintPerformanceCounts(std::string fullDeviceName) const {
+        handler.PrintPerformanceCounts(fullDeviceName);
     }
 };
 

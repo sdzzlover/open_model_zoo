@@ -1,4 +1,4 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 #include <algorithm>
+#include <numeric>
+#include <functional>
 
 #include <opencv2/core/core.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
@@ -16,46 +18,42 @@
 using namespace InferenceEngine;
 
 CnnBase::CnnBase(const Config& config,
-                 const InferenceEngine::InferencePlugin& plugin) :
-    config_(config), net_plugin_(plugin) {}
+                 const InferenceEngine::Core & ie,
+                 const std::string & deviceName) :
+    config_(config), ie_(ie), deviceName_(deviceName) {}
 
 void CnnBase::Load() {
-    CNNNetReader net_reader;
-    net_reader.ReadNetwork(config_.path_to_model);
-    net_reader.ReadWeights(config_.path_to_weights);
+    auto cnnNetwork = ie_.ReadNetwork(config_.path_to_model);
 
-    if (!net_reader.isParseSuccess()) {
-        THROW_IE_EXCEPTION << "Cannot load model";
-    }
-
-    const int currentBatchSize = net_reader.getNetwork().getBatchSize();
+    const int currentBatchSize = cnnNetwork.getBatchSize();
     if (currentBatchSize != config_.max_batch_size)
-        net_reader.getNetwork().setBatchSize(config_.max_batch_size);
+        cnnNetwork.setBatchSize(config_.max_batch_size);
 
     InferenceEngine::InputsDataMap in;
-    in = net_reader.getNetwork().getInputsInfo();
+    in = cnnNetwork.getInputsInfo();
     if (in.size() != 1) {
         THROW_IE_EXCEPTION << "Network should have only one input";
     }
 
     SizeVector inputDims = in.begin()->second->getTensorDesc().getDims();
-    in.begin()->second->setInputPrecision(Precision::U8);
+    in.begin()->second->setPrecision(Precision::U8);
     input_blob_ = make_shared_blob<uint8_t>(TensorDesc(Precision::U8, inputDims, Layout::NCHW));
     input_blob_->allocate();
     BlobMap inputs;
     inputs[in.begin()->first] = input_blob_;
-    outInfo_ = net_reader.getNetwork().getOutputsInfo();
+    outInfo_ = cnnNetwork.getOutputsInfo();
 
     for (auto&& item : outInfo_) {
         SizeVector outputDims = item.second->getTensorDesc().getDims();
+        auto outputLayout = item.second->getTensorDesc().getLayout();
         item.second->setPrecision(Precision::FP32);
         TBlob<float>::Ptr output =
-            make_shared_blob<float>(TensorDesc(Precision::FP32, outputDims, Layout::NC));
+            make_shared_blob<float>(TensorDesc(Precision::FP32, outputDims, outputLayout));
         output->allocate();
         outputs_[item.first] = output;
     }
 
-    executable_network_ = net_plugin_.LoadNetwork(net_reader.getNetwork(), {});
+    executable_network_ = ie_.LoadNetwork(cnnNetwork, deviceName_);
     infer_request_ = executable_network_.CreateInferRequest();
     infer_request_.SetInput(inputs);
     infer_request_.SetOutput(outputs_);
@@ -63,7 +61,7 @@ void CnnBase::Load() {
 
 void CnnBase::InferBatch(
     const std::vector<cv::Mat>& frames,
-    std::function<void(const InferenceEngine::BlobMap&, size_t)> fetch_results) const {
+    const std::function<void(const InferenceEngine::BlobMap&, size_t)>& fetch_results) const {
     const size_t batch_size = input_blob_->getTensorDesc().getDims()[0];
 
     size_t num_imgs = frames.size();
@@ -73,38 +71,34 @@ void CnnBase::InferBatch(
             matU8ToBlob<uint8_t>(frames[batch_i + b], input_blob_, b);
         }
 
-        infer_request_.SetBatch(current_batch_size);
         infer_request_.Infer();
 
         fetch_results(outputs_, current_batch_size);
     }
 }
 
-void CnnBase::PrintPerformanceCounts() const {
+void CnnBase::PrintPerformanceCounts(std::string fullDeviceName) const {
     std::cout << "Performance counts for " << config_.path_to_model << std::endl << std::endl;
-    ::printPerformanceCounts(infer_request_.GetPerformanceCounts(), std::cout, false);
+    ::printPerformanceCounts(infer_request_, std::cout, fullDeviceName, false);
 }
 
 void CnnBase::Infer(const cv::Mat& frame,
-                    std::function<void(const InferenceEngine::BlobMap&, size_t)> fetch_results) const {
+                    const std::function<void(const InferenceEngine::BlobMap&, size_t)>& fetch_results) const {
     InferBatch({frame}, fetch_results);
 }
 
 VectorCNN::VectorCNN(const Config& config,
-                     const InferenceEngine::InferencePlugin& plugin)
-    : CnnBase(config, plugin) {
+                     const InferenceEngine::Core& ie,
+                     const std::string & deviceName)
+    : CnnBase(config, ie, deviceName) {
     Load();
 
     if (outputs_.size() != 1) {
         THROW_IE_EXCEPTION << "Demo supports topologies only with 1 output";
     }
-    InferenceEngine::SizeVector dims = outInfo_.begin()->second->dims;
-    int num_dims = static_cast<int>(dims.size());
 
-    result_size_ = 1;
-    for (int i = 0; i < num_dims - 1; ++i) {
-        result_size_ *= dims[i];
-    }
+    InferenceEngine::SizeVector dims = outInfo_.begin()->second->getTensorDesc().getDims();
+    result_size_ = std::accumulate(std::next(dims.begin(), 1), dims.end(), 1, std::multiplies<int>());
 }
 
 void VectorCNN::Compute(const cv::Mat& frame,
@@ -131,7 +125,8 @@ void VectorCNN::Compute(const std::vector<cv::Mat>& images, std::vector<cv::Mat>
             for (size_t i = 0; i < blob_sizes.size(); ++i) {
                 blob_sizes[i] = ie_output_dims[i];
             }
-            cv::Mat out_blob(blob_sizes, CV_32F, blob->buffer());
+            LockedMemory<const void> blobMapped = as<MemoryBlob>(blob)->rmap();
+            cv::Mat out_blob(blob_sizes, CV_32F, blobMapped.as<float*>());
             for (size_t b = 0; b < batch_size; b++) {
                 cv::Mat blob_wrapper(out_blob.size[1], 1, CV_32F,
                                      reinterpret_cast<void*>((out_blob.ptr<float>(0) + b * out_blob.size[1])));

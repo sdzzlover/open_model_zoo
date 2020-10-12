@@ -1,4 +1,4 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -6,14 +6,12 @@
 
 #include <opencv2/imgproc.hpp>
 
-#include <ie_plugin_config.hpp>
-
 #include <algorithm>
 #include <vector>
 #include <map>
 #include <string>
+#include <set>
 #include <memory>
-#include <ext_list.hpp>
 
 using namespace InferenceEngine;
 
@@ -64,39 +62,39 @@ void PrintDetectionLog(const DetectionLog& log) {
     SaveDetectionLogToStream(std::cout, log);
 }
 
-
-std::map<std::string, InferencePlugin>
-LoadPluginForDevices(const std::vector<std::string>& devices,
-                     const std::string& custom_cpu_library,
-                     const std::string& custom_cldnn_kernels,
-                     bool should_use_perf_counter) {
-    std::map<std::string, InferencePlugin> plugins_for_devices;
+InferenceEngine::Core
+LoadInferenceEngine(const std::vector<std::string>& devices,
+                    const std::string& custom_cpu_library,
+                    const std::string& custom_cldnn_kernels,
+                    bool should_use_perf_counter) {
+    std::set<std::string> loadedDevices;
+    Core ie;
 
     for (const auto &device : devices) {
-        if (plugins_for_devices.find(device) != plugins_for_devices.end()) {
+        if (loadedDevices.find(device) != loadedDevices.end()) {
             continue;
         }
-        std::cout << "Loading plugin " << device << std::endl;
-        InferencePlugin plugin = PluginDispatcher({"../../../lib/intel64", ""}).getPluginByDevice(device);
-        printPluginVersion(plugin, std::cout);
-        /** Load extensions for the CPU plugin **/
+
+        std::cout << "Loading device " << device << std::endl;
+        std::cout << ie.GetVersions(device) << std::endl;
+
+        /** Load extensions for the CPU device **/
         if ((device.find("CPU") != std::string::npos)) {
-            plugin.AddExtension(std::make_shared<Extensions::Cpu::CpuExtensions>());
             if (!custom_cpu_library.empty()) {
                 // CPU(MKLDNN) extensions are loaded as a shared library and passed as a pointer to base extension
                 auto extension_ptr = make_so_pointer<IExtension>(custom_cpu_library);
-                plugin.AddExtension(std::static_pointer_cast<IExtension>(extension_ptr));
+                ie.AddExtension(std::static_pointer_cast<IExtension>(extension_ptr), "CPU");
             }
         } else if (!custom_cldnn_kernels.empty()) {
             // Load Extensions for other plugins not CPU
-            plugin.SetConfig({{PluginConfigParams::KEY_CONFIG_FILE,
-                             custom_cldnn_kernels}});
+            ie.SetConfig({{PluginConfigParams::KEY_CONFIG_FILE, custom_cldnn_kernels}}, "GPU");
         }
-        plugin.SetConfig({{PluginConfigParams::KEY_DYN_BATCH_ENABLED, PluginConfigParams::YES}});
-        if (should_use_perf_counter)
-            plugin.SetConfig({{PluginConfigParams::KEY_PERF_COUNT, PluginConfigParams::YES}});
-        plugins_for_devices[device] = plugin;
-    }
-    return plugins_for_devices;
-}
 
+        if (should_use_perf_counter)
+            ie.SetConfig({{PluginConfigParams::KEY_PERF_COUNT, PluginConfigParams::YES}});
+
+        loadedDevices.insert(device);
+    }
+
+    return ie;
+}

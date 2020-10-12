@@ -1,33 +1,28 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#include <gflags/gflags.h>
-#include <functional>
+#include <chrono>
 #include <iostream>
-#include <memory>
-#include <map>
-#include <fstream>
-#include <random>
 #include <string>
 #include <vector>
-#include <time.h>
-#include <chrono>
-#include <limits>
-#include <iomanip>
+
+#include <gflags/gflags.h>
+
+#include <opencv2/videoio.hpp>
 
 #include <inference_engine.hpp>
-#include <ext_list.hpp>
 
-#include <format_reader_ptr.h>
-
+#include <monitors/presenter.h>
 #include <samples/common.hpp>
+#include <samples/images_capture.h>
+#include <samples/ocv_common.hpp>
 #include <samples/slog.hpp>
-#include <samples/args_helper.hpp>
 
 #include "segmentation_demo.h"
 
 using namespace InferenceEngine;
+typedef std::chrono::duration<double, std::chrono::milliseconds::period> Ms;
 
 bool ParseAndCheckCommandLine(int argc, char *argv[]) {
     // ---------------------------Parsing and validation of input args--------------------------------------
@@ -36,11 +31,8 @@ bool ParseAndCheckCommandLine(int argc, char *argv[]) {
     gflags::ParseCommandLineNonHelpFlags(&argc, &argv, true);
     if (FLAGS_h) {
         showUsage();
+        showAvailableDevices();
         return false;
-    }
-
-    if (FLAGS_ni < 1) {
-        throw std::logic_error("Parameter -ni should be greater than 0 (default: 1)");
     }
 
     if (FLAGS_i.empty()) {
@@ -54,237 +46,176 @@ bool ParseAndCheckCommandLine(int argc, char *argv[]) {
     return true;
 }
 
-/**
- * @brief The entry point for inference engine deconvolution demo application
- * @file segmentation_demo/main.cpp
- * @example segmentation_demo/main.cpp
- */
 int main(int argc, char *argv[]) {
     try {
-        slog::info << "InferenceEngine: " << GetInferenceEngineVersion() << slog::endl;
-
-        // ------------------------------ Parsing and validation of input args ---------------------------------
+        slog::info << "InferenceEngine: " << *GetInferenceEngineVersion() << slog::endl;
         if (!ParseAndCheckCommandLine(argc, argv)) {
             return 0;
         }
 
-        /** This vector stores paths to the processed images **/
-        std::vector<std::string> images;
-        parseInputFilesArguments(images);
-        if (images.empty()) throw std::logic_error("No suitable images were found");
-        // -----------------------------------------------------------------------------------------------------
-
-        // --------------------------- 1. Load Plugin for inference engine -------------------------------------
-        slog::info << "Loading plugin" << slog::endl;
-        InferencePlugin plugin = PluginDispatcher({ FLAGS_pp, "../../../lib/intel64" , "" }).getPluginByDevice(FLAGS_d);
-
-        /** Loading default extensions **/
-        if (FLAGS_d.find("CPU") != std::string::npos) {
-            /**
-             * cpu_extensions library is compiled from "extension" folder containing
-             * custom MKLDNNPlugin layer implementations. These layers are not supported
-             * by mkldnn, but they can be useful for inferring custom topologies.
-            **/
-            plugin.AddExtension(std::make_shared<Extensions::Cpu::CpuExtensions>());
-        }
+        Core ie;
 
         if (!FLAGS_l.empty()) {
             // CPU(MKLDNN) extensions are loaded as a shared library and passed as a pointer to base extension
             IExtensionPtr extension_ptr = make_so_pointer<IExtension>(FLAGS_l);
-            plugin.AddExtension(extension_ptr);
+            ie.AddExtension(extension_ptr, "CPU");
             slog::info << "CPU Extension loaded: " << FLAGS_l << slog::endl;
         }
         if (!FLAGS_c.empty()) {
             // clDNN Extensions are loaded from an .xml description and OpenCL kernel files
-            plugin.SetConfig({{PluginConfigParams::KEY_CONFIG_FILE, FLAGS_c}});
+            ie.SetConfig({{PluginConfigParams::KEY_CONFIG_FILE, FLAGS_c}}, "GPU");
             slog::info << "GPU Extension loaded: " << FLAGS_c << slog::endl;
         }
 
-        /** Setting plugin parameter for per layer metrics **/
-        if (FLAGS_pc) {
-            plugin.SetConfig({ { PluginConfigParams::KEY_PERF_COUNT, PluginConfigParams::YES } });
+        slog::info << "Device info" << slog::endl;
+        std::cout << ie.GetVersions(FLAGS_d);
+
+        CNNNetwork network = ie.ReadNetwork(FLAGS_m);
+
+        ICNNNetwork::InputShapes inputShapes = network.getInputShapes();
+        if (inputShapes.size() != 1)
+            throw std::runtime_error("Demo supports topologies only with 1 input");
+        const std::string& inName = inputShapes.begin()->first;
+        SizeVector& inSizeVector = inputShapes.begin()->second;
+        if (inSizeVector.size() != 4 || inSizeVector[1] != 3)
+            throw std::runtime_error("3-channel 4-dimensional model's input is expected");
+        inSizeVector[0] = 1;  // set batch size to 1
+        network.reshape(inputShapes);
+
+        InputInfo& inputInfo = *network.getInputsInfo().begin()->second;
+        inputInfo.getPreProcess().setResizeAlgorithm(ResizeAlgorithm::RESIZE_BILINEAR);
+        inputInfo.setLayout(Layout::NHWC);
+        inputInfo.setPrecision(Precision::U8);
+
+        const OutputsDataMap& outputsDataMap = network.getOutputsInfo();
+        if (outputsDataMap.size() != 1) throw std::runtime_error("Demo supports topologies only with 1 output");
+        const std::string& outName = outputsDataMap.begin()->first;
+        Data& data = *outputsDataMap.begin()->second;
+        // if the model performs ArgMax, its output type can be I32 but for models that return heatmaps for each
+        // class the output is usually FP32. Reset the precision to avoid handling different types with switch in
+        // postprocessing
+        data.setPrecision(Precision::FP32);
+        const SizeVector& outSizeVector = data.getTensorDesc().getDims();
+        int outChannels, outHeight, outWidth;
+        switch(outSizeVector.size()) {
+            case 3:
+                outChannels = 0;
+                outHeight = outSizeVector[1];
+                outWidth = outSizeVector[2];
+                break;
+            case 4:
+                outChannels = outSizeVector[1];
+                outHeight = outSizeVector[2];
+                outWidth = outSizeVector[3];
+                break;
+            default:
+                throw std::runtime_error("Unexpected output blob shape. Only 4D and 3D output blobs are"
+                    "supported.");
         }
-        /** Printing plugin version **/
-        printPluginVersion(plugin, std::cout);
-        // -----------------------------------------------------------------------------------------------------
 
-        // --------------------------- 2. Read IR Generated by ModelOptimizer (.xml and .bin files) ------------
-        slog::info << "Loading network files" << slog::endl;
+        ExecutableNetwork executableNetwork = ie.LoadNetwork(network, FLAGS_d);
+        InferRequest inferRequest = executableNetwork.CreateInferRequest();
 
-        CNNNetReader networkReader;
-        /** Read network model **/
-        networkReader.ReadNetwork(FLAGS_m);
-
-        /** Extract model name and load weights **/
-        std::string binFileName = fileNameNoExt(FLAGS_m) + ".bin";
-        networkReader.ReadWeights(binFileName);
-        CNNNetwork network = networkReader.getNetwork();
-        // -----------------------------------------------------------------------------------------------------
-
-        // --------------------------- 3. Configure input & output ---------------------------------------------
-
-        // --------------------------- Prepare input blobs -----------------------------------------------------
-        slog::info << "Preparing input blobs" << slog::endl;
-
-        /** Taking information about all topology inputs **/
-        InputsDataMap inputInfo(network.getInputsInfo());
-        /** Stores all input blobs data **/
-        BlobMap inputBlobs;
-
-        if (inputInfo.size() != 1) throw std::logic_error("Demo supports topologies only with 1 input");
-        auto inputInfoItem = *inputInfo.begin();
-
-        /** Collect images data ptrs **/
-        std::vector<std::shared_ptr<unsigned char>> imagesData;
-        for (auto & i : images) {
-            FormatReader::ReaderPtr reader(i.c_str());
-            if (reader.get() == nullptr) {
-                slog::warn << "Image " + i + " cannot be read!" << slog::endl;
-                continue;
-            }
-            /** Getting image data **/
-            std::shared_ptr<unsigned char> data(reader->getData(inputInfoItem.second->getTensorDesc().getDims()[3],
-                                                                inputInfoItem.second->getTensorDesc().getDims()[2]));
-            if (data.get() != nullptr) {
-                imagesData.push_back(data);
-            }
+        std::unique_ptr<ImagesCapture> cap = openImagesCapture(FLAGS_i, FLAGS_loop);
+        cv::Mat inImg = cap->read();
+        if (!inImg.data) {
+            throw std::runtime_error("Can't read an image from the input");
         }
-        if (imagesData.empty()) throw std::logic_error("Valid input images were not found!");
 
-        /** Setting batch size using image count **/
-        network.setBatchSize(imagesData.size());
-        slog::info << "Batch size is " << std::to_string(networkReader.getNetwork().getBatchSize()) << slog::endl;
-
-        inputInfoItem.second->setPrecision(Precision::U8);
-
-        // --------------------------- Prepare output blobs ----------------------------------------------------
-        slog::info << "Preparing output blobs" << slog::endl;
-
-        OutputsDataMap outputInfo(network.getOutputsInfo());
-        // BlobMap outputBlobs;
-        std::string firstOutputName;
-
-        for (auto & item : outputInfo) {
-            if (firstOutputName.empty()) {
-                firstOutputName = item.first;
-            }
-            DataPtr outputData = item.second;
-            if (!outputData) {
-                throw std::logic_error("output data pointer is not valid");
-            }
-
-            item.second->setPrecision(Precision::FP32);
+        float blending = 0.3f;
+        constexpr char WIN_NAME[] = "segmentation";
+        if (!FLAGS_no_show) {
+            cv::namedWindow(WIN_NAME);
+            int initValue = static_cast<int>(blending * 100);
+            cv::createTrackbar("blending", WIN_NAME, &initValue, 100,
+                [](int position, void* blendingPtr){*static_cast<float*>(blendingPtr) = position * 0.01f;},
+                &blending);
         }
-        // -----------------------------------------------------------------------------------------------------
 
-        // --------------------------- 4. Loading model to the plugin ------------------------------------------
-        slog::info << "Loading model to the plugin" << slog::endl;
-        ExecutableNetwork executable_network = plugin.LoadNetwork(network, {});
-        // -----------------------------------------------------------------------------------------------------
+        cv::Mat resImg, maskImg(outHeight, outWidth, CV_8UC3);
+        std::vector<cv::Vec3b> colors(arraySize(CITYSCAPES_COLORS));
+        for (std::size_t i = 0; i < colors.size(); ++i)
+            colors[i] = {CITYSCAPES_COLORS[i].blue(), CITYSCAPES_COLORS[i].green(), CITYSCAPES_COLORS[i].red()};
+        std::mt19937 rng;
+        std::uniform_int_distribution<int> distr(0, 255);
+        int delay = FLAGS_delay;
+        Presenter presenter(FLAGS_u, 10, {inImg.cols / 4, 60});
 
-        // --------------------------- 5. Create infer request -------------------------------------------------
-        InferRequest infer_request = executable_network.CreateInferRequest();
-        // -----------------------------------------------------------------------------------------------------
+        std::chrono::steady_clock::duration latencySum{0};
+        unsigned latencySamplesNum = 0;
+        std::ostringstream latencyStream;
 
-        // --------------------------- 6. Prepare input --------------------------------------------------------
-        /** Iterate over all the input blobs **/
-        /** Iterating over all input blobs **/
-        for (const auto & item : inputInfo) {
-            /** Creating input blob **/
-            Blob::Ptr input = infer_request.GetBlob(item.first);
+        std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        while (inImg.data && delay >= 0) {
+            if (CV_8UC3 != inImg.type())
+                throw std::runtime_error("BGR (or RGB) image expected to come from input");
+            inferRequest.SetBlob(inName, wrapMat2Blob(inImg));
+            inferRequest.Infer();
 
-            /** Fill input tensor with images. First r channel, then g and b channels **/
-            size_t num_channels = input->getTensorDesc().getDims()[1];
-            size_t image_size = input->getTensorDesc().getDims()[3] * input->getTensorDesc().getDims()[2];
-
-            auto data = input->buffer().as<PrecisionTrait<Precision::U8>::value_type*>();
-
-            /** Iterate over all input images **/
-            for (size_t image_id = 0; image_id < imagesData.size(); ++image_id) {
-                /** Iterate over all pixel in image (r,g,b) **/
-                for (size_t pid = 0; pid < image_size; pid++) {
-                    /** Iterate over all channels **/
-                    for (size_t ch = 0; ch < num_channels; ++ch) {
-                        /**          [images stride + channels stride + pixel id ] all in bytes            **/
-                        data[image_id * image_size * num_channels + ch * image_size + pid] = imagesData.at(image_id).get()[pid*num_channels + ch];
-                    }
-                }
-            }
-        }
-        // -----------------------------------------------------------------------------------------------------
-
-        // --------------------------- 7. Do inference ---------------------------------------------------------
-        slog::info << "Start inference (" << FLAGS_ni << " iterations)" << slog::endl;
-
-        typedef std::chrono::high_resolution_clock Time;
-        typedef std::chrono::duration<double, std::ratio<1, 1000>> ms;
-        typedef std::chrono::duration<float> fsec;
-
-        double total = 0.0;
-        /** Start inference & calc performance **/
-        for (int iter = 0; iter < FLAGS_ni; ++iter) {
-            auto t0 = Time::now();
-            infer_request.Infer();
-            auto t1 = Time::now();
-            fsec fs = t1 - t0;
-            ms d = std::chrono::duration_cast<ms>(fs);
-            total += d.count();
-        }
-        // -----------------------------------------------------------------------------------------------------
-
-        // --------------------------- 8. Process output -------------------------------------------------------
-        slog::info << "Processing output blobs" << slog::endl;
-
-        const Blob::Ptr output_blob = infer_request.GetBlob(firstOutputName);
-        const auto output_data = output_blob->buffer().as<float*>();
-
-        size_t N = output_blob->getTensorDesc().getDims().at(0);
-        size_t C = output_blob->getTensorDesc().getDims().at(1);
-        size_t H = output_blob->getTensorDesc().getDims().at(2);
-        size_t W = output_blob->getTensorDesc().getDims().at(3);
-
-        size_t image_stride = W*H*C;
-
-        /** Iterating over all images **/
-        for (size_t image = 0; image < N; ++image) {
-            /** This vector stores pixels classes **/
-            std::vector<std::vector<size_t>> outArrayClasses(H, std::vector<size_t>(W, 0));
-            std::vector<std::vector<float>> outArrayProb(H, std::vector<float>(W, 0.));
-            /** Iterating over each pixel **/
-            for (size_t w = 0; w < W; ++w) {
-                for (size_t h = 0; h < H; ++h) {
-                    /* number of channels = 1 means that the output is already ArgMax'ed */
-                    if (C == 1) {
-                        outArrayClasses[h][w] = output_data[image_stride * image + W * h + w];
+            LockedMemory<const void> outMapped = as<MemoryBlob>(inferRequest.GetBlob(outName))->rmap();
+            const float * const predictions = outMapped.as<float*>();
+            for (int rowId = 0; rowId < outHeight; ++rowId) {
+                for (int colId = 0; colId < outWidth; ++colId) {
+                    std::size_t classId = 0;
+                    if (outChannels < 2) {  // assume the output is already ArgMax'ed
+                        classId = static_cast<std::size_t>(predictions[rowId * outWidth + colId]);
                     } else {
-                        /** Iterating over each class probability **/
-                        for (size_t ch = 0; ch < C; ++ch) {
-                            auto data = output_data[image_stride * image + W * H * ch + W * h + w];
-                            if (data > outArrayProb[h][w]) {
-                                outArrayClasses[h][w] = ch;
-                                outArrayProb[h][w] = data;
+                        float maxProb = -1.0f;
+                        for (int chId = 0; chId < outChannels; ++chId) {
+                            float prob = predictions[chId * outHeight * outWidth + rowId * outWidth + colId];
+                            if (prob > maxProb) {
+                                classId = chId;
+                                maxProb = prob;
                             }
                         }
                     }
+                    while (classId >= colors.size()) {
+                        cv::Vec3b color(distr(rng), distr(rng), distr(rng));
+                        colors.push_back(color);
+                    }
+                    maskImg.at<cv::Vec3b>(rowId, colId) = colors[classId];
                 }
             }
-            /** Dump resulting image **/
-            std::string fileName = "out_" + std::to_string(image) + ".bmp";
-            std::ofstream outFile(fileName, std::ofstream::binary);
-            if (!outFile.is_open()) {
-                throw std::logic_error("Can't open file : " + fileName);
+            cv::resize(maskImg, resImg, inImg.size());
+            resImg = inImg * blending + resImg * (1 - blending);
+            presenter.drawGraphs(resImg);
+
+            latencySum += std::chrono::steady_clock::now() - t0;
+            ++latencySamplesNum;
+            latencyStream.str("");
+            latencyStream << std::fixed << std::setprecision(1)
+                << (std::chrono::duration_cast<Ms>(latencySum) / latencySamplesNum).count() << " ms";
+            constexpr int FONT_FACE = cv::FONT_HERSHEY_SIMPLEX;
+            constexpr double FONT_SCALE = 2;
+            constexpr int THICKNESS = 2;
+            int baseLine;
+            cv::getTextSize(latencyStream.str(), FONT_FACE, FONT_SCALE, THICKNESS, &baseLine);
+            cv::putText(resImg, latencyStream.str(), cv::Size{0, resImg.rows - baseLine}, FONT_FACE, FONT_SCALE,
+                cv::Scalar{255, 0, 0}, THICKNESS);
+
+            if (!FLAGS_no_show) {
+                cv::imshow(WIN_NAME, resImg);
+                int key = cv::waitKey(delay);
+                switch(key) {
+                    case 'q':
+                    case 'Q':
+                    case 27: // Esc
+                        delay = -1;
+                        break;
+                    case 'p':
+                    case 'P':
+                    case ' ':
+                        delay = !delay * (FLAGS_delay + !FLAGS_delay);
+                        break;
+                    default:
+                        presenter.handleKey(key);
+                }
             }
-
-            writeOutputBmp(outArrayClasses, C, outFile);
-            slog::info << "File : " << fileName << " was created" << slog::endl;
+            t0 = std::chrono::steady_clock::now();
+            inImg = cap->read();
         }
-        // -----------------------------------------------------------------------------------------------------
-        std::cout << std::endl << "Average running time of one iteration: " << total / static_cast<double>(FLAGS_ni) << " ms" << std::endl << std::endl;
-
-        /** Show performance results **/
-        if (FLAGS_pc) {
-            printPerformanceCounts(infer_request, std::cout);
-        }
+        std::cout << "Mean pipeline latency: " << latencyStream.str() << '\n';
+        std::cout << presenter.reportMeans() << '\n';
     }
     catch (const std::exception& error) {
         slog::err << error.what() << slog::endl;

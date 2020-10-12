@@ -1,4 +1,4 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -18,8 +18,6 @@
 #include "utils.hpp"
 #include "descriptor.hpp"
 #include "distance.hpp"
-
-
 
 ///
 /// \brief The TrackerParams struct stores parameters of PedestrianTracker
@@ -203,12 +201,6 @@ public:
     const TrackerParams &params() const;
 
     ///
-    /// \brief Pipeline parameters setter.
-    /// \param[in] params Parameters of pipeline.
-    ///
-    void set_params(const TrackerParams &params);
-
-    ///
     /// \brief Fast descriptor getter.
     /// \return Fast descriptor used in pipeline.
     ///
@@ -257,12 +249,6 @@ public:
     void set_distance_strong(const Distance &val);
 
     ///
-    /// \brief Returns number of counted people.
-    /// \return a number of counted people.
-    ///
-    size_t Count() const;
-
-    ///
     /// \brief Returns a detection log which is used for tracks saving.
     /// \param[in] valid_only If it is true the method returns valid track only.
     /// \return a detection log which is used for tracks saving.
@@ -287,13 +273,6 @@ public:
     /// \return Colored image with drawn active tracks.
     ///
     cv::Mat DrawActiveTracks(const cv::Mat &frame);
-
-    ///
-    /// \brief Print confusion matrices of data association classifiers.
-    /// It works only in case of loaded detection logs instead of native
-    /// detectors.
-    ///
-    void PrintConfusionMatrices() const;
 
     ///
     /// \brief IsTrackForgotten returns true if track is forgotten.
@@ -323,16 +302,9 @@ public:
     void DropForgottenTracks();
 
     ///
-    /// \brief DropForgottenTracks Check that the track was lost too many frames
-    /// ago
-    /// and removes it frm memory.
-    ///
-    void DropForgottenTrack(size_t track_id);
-
-    ///
     /// \brief Prints reid performance counter
     ///
-    void PrintReidPerformanceCounts() const;
+    void PrintReidPerformanceCounts(std::string fullDeviceName) const;
 
 private:
     struct Match {
@@ -436,21 +408,7 @@ private:
 
     void UpdateLostTracks(const std::set<size_t> &track_ids);
 
-    static cv::Mat ConfusionMatrix(const std::vector<Match> &matches);
-
     const std::set<size_t> &active_track_ids() const;
-
-    // Returns decisions made by heuristic based on fast distance/descriptor and
-    // shape, motion and time affinity.
-    const std::vector<Match> & base_classifier_matches() const;
-
-    // Returns decisions made by heuristic based on strong distance/descriptor
-    // and
-    // shape, motion and time affinity.
-    const std::vector<Match> &reid_based_classifier_matches() const;
-
-    // Returns decisions made by strong distance/descriptor affinity.
-    const std::vector<Match> &reid_classifier_matches() const;
 
     TrackedObjects FilterDetections(const TrackedObjects &detections) const;
     bool IsTrackForgotten(const Track &track) const;
@@ -482,36 +440,15 @@ private:
     struct pair_hash {
         std::size_t operator()(const std::pair<size_t, size_t> &p) const {
             PT_CHECK(p.first < 1e6 && p.second < 1e6);
-            return p.first * 1e6 + p.second;
+            return static_cast<size_t>(p.first * 1e6 + p.second);
         }
     };
 
     // Distance between current active tracks.
     std::unordered_map<std::pair<size_t, size_t>, float, pair_hash> tracks_dists_;
 
-    // Whether collect matches and compute confusion matrices for
-    // track-detection
-    // association task (base classifier, reid-based classifier,
-    // reid-classiifer).
-    bool collect_matches_;
-
-    // This vector contains decisions made by
-    // fast_apperance-motion-shape affinity model.
-    std::vector<Match> base_classifier_matches_;
-
-    // This vector contains decisions made by
-    // strong_apperance(cnn-reid)-motion-shape affinity model.
-    std::vector<Match> reid_based_classifier_matches_;
-
-    // This vector contains decisions made by
-    // strong_apperance(cnn-reid) affinity model only.
-    std::vector<Match> reid_classifier_matches_;
-
     // Number of all current tracks.
     size_t tracks_counter_;
-
-    // Number of dropped valid tracks.
-    size_t valid_tracks_counter_;
 
     cv::Size frame_size_;
 

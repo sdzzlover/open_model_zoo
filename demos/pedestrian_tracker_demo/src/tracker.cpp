@@ -1,4 +1,4 @@
-// Copyright (C) 2018 Intel Corporation
+// Copyright (C) 2018-2019 Intel Corporation
 // SPDX-License-Identifier: Apache-2.0
 //
 
@@ -19,7 +19,8 @@
 
 namespace {
 cv::Point Center(const cv::Rect& rect) {
-    return cv::Point(rect.x + rect.width * .5, rect.y + rect.height * .5);
+    return cv::Point(static_cast<int>(rect.x + rect.width * 0.5),
+                     static_cast<int>(rect.y + rect.height * 0.5));
 }
 
 std::vector<cv::Point> Centers(const TrackedObjects &detections) {
@@ -77,17 +78,17 @@ std::vector<cv::Scalar> GenRandomColors(int colors_num) {
 TrackerParams::TrackerParams()
     : min_track_duration(1000),
     forget_delay(150),
-    aff_thr_fast(0.8),
-    aff_thr_strong(0.75),
-    shape_affinity_w(0.5),
-    motion_affinity_w(0.2),
-    time_affinity_w(0.0),
-    min_det_conf(0.65),
-    bbox_aspect_ratios_range(0.666, 5.0),
+    aff_thr_fast(0.8f),
+    aff_thr_strong(0.75f),
+    shape_affinity_w(0.5f),
+    motion_affinity_w(0.2f),
+    time_affinity_w(0.0f),
+    min_det_conf(0.65f),
+    bbox_aspect_ratios_range(0.666f, 5.0f),
     bbox_heights_range(40, 1000),
     predict(25),
-    strong_affinity_thr(0.2805),
-    reid_thr(0.61),
+    strong_affinity_thr(0.2805f),
+    reid_thr(0.61f),
     drop_forgotten_tracks(true),
     max_num_objects_in_track(300) {}
 
@@ -140,26 +141,11 @@ void ValidateParams(const TrackerParams &p) {
     }
 }
 
-// Returns confusion matrix as:
-//   |tp fn|
-//   |fp tn|
-cv::Mat PedestrianTracker::ConfusionMatrix(const std::vector<Match> &matches) {
-    const bool kNegative = false;
-    cv::Mat conf_mat(2, 2, CV_32F, cv::Scalar(0));
-    for (const auto &m : matches) {
-        conf_mat.at<float>(m.gt_label == kNegative, m.pr_label == kNegative)++;
-    }
-
-    return conf_mat;
-}
-
 PedestrianTracker::PedestrianTracker(const TrackerParams &params)
     : params_(params),
     descriptor_strong_(nullptr),
     distance_strong_(nullptr),
-    collect_matches_(true),
     tracks_counter_(0),
-    valid_tracks_counter_(0),
     frame_size_(0, 0),
     prev_timestamp_(std::numeric_limits<uint64_t>::max()) {
         ValidateParams(params);
@@ -167,12 +153,6 @@ PedestrianTracker::PedestrianTracker(const TrackerParams &params)
 
 // Pipeline parameters getter.
 const TrackerParams &PedestrianTracker::params() const { return params_; }
-
-// Pipeline parameters setter.
-void PedestrianTracker::set_params(const TrackerParams &params) {
-    ValidateParams(params);
-    params_ = params;
-}
 
 // Descriptor fast getter.
 const PedestrianTracker::Descriptor &PedestrianTracker::descriptor_fast() const {
@@ -223,25 +203,6 @@ DetectionLog PedestrianTracker::GetDetectionLog(const bool valid_only) const {
     return ConvertTracksToDetectionLog(all_tracks(valid_only));
 }
 
-// Returns decisions made by heuristic based on fast distance/descriptor and
-// shape, motion and time affinity.
-const std::vector<PedestrianTracker::Match> &
-PedestrianTracker::base_classifier_matches() const {
-    return base_classifier_matches_;
-}
-
-// Returns decisions made by heuristic based on strong distance/descriptor
-// and
-// shape, motion and time affinity.
-const std::vector<PedestrianTracker::Match> &PedestrianTracker::reid_based_classifier_matches() const {
-    return reid_based_classifier_matches_;
-}
-
-// Returns decisions made by strong distance/descriptor affinity.
-const std::vector<PedestrianTracker::Match> &PedestrianTracker::reid_classifier_matches() const {
-    return reid_classifier_matches_;
-}
-
 TrackedObjects PedestrianTracker::FilterDetections(
     const TrackedObjects &detections) const {
     TrackedObjects filtered_detections;
@@ -249,7 +210,7 @@ TrackedObjects PedestrianTracker::FilterDetections(
         float aspect_ratio = static_cast<float>(det.rect.height) / det.rect.width;
         if (det.confidence > params_.min_det_conf &&
             IsInRange(aspect_ratio, params_.bbox_aspect_ratios_range) &&
-            IsInRange(det.rect.height, params_.bbox_heights_range)) {
+            IsInRange(static_cast<float>(det.rect.height), params_.bbox_heights_range)) {
             filtered_detections.emplace_back(det);
         }
     }
@@ -281,8 +242,6 @@ void PedestrianTracker::SolveAssignmentProblem(
     for (size_t i = 0; i < detections.size(); i++) {
         unmatched_detections->insert(i);
     }
-
-    constexpr float kMinIOUForPossibleDuplicates = 0.3;
 
     size_t i = 0;
     for (auto id : track_ids) {
@@ -353,8 +312,10 @@ cv::Rect PedestrianTracker::PredictRect(size_t id, size_t k,
     s += 1;
 
     cv::Point c = Center(track.back().rect);
-    return cv::Rect(c.x - width / 2 + d.x * s, c.y - height / 2 + d.y * s, width,
-                    height);
+    return cv::Rect(static_cast<int>(c.x - width / 2 + d.x * s),
+                    static_cast<int>(c.y - height / 2 + d.y * s),
+                    static_cast<int>(width),
+                    static_cast<int>(height));
 }
 
 
@@ -457,13 +418,6 @@ void PedestrianTracker::Process(const cv::Mat &frame,
             auto last_det = tracks_.at(track_id).objects.back();
             last_det.rect = tracks_.at(track_id).predicted_rect;
 
-            if (collect_matches_ && last_det.object_id >= 0 &&
-                detections[det_id].object_id >= 0) {
-                base_classifier_matches_.emplace_back(
-                    tracks_.at(track_id).objects.back(), last_det.rect,
-                    detections[det_id], conf > params_.aff_thr_fast);
-            }
-
             if (conf > params_.aff_thr_fast) {
                 AppendToTrack(frame, track_id, detections[det_id],
                               descriptors_fast[det_id], cv::Mat());
@@ -526,11 +480,6 @@ void PedestrianTracker::DropForgottenTracks() {
             new_tracks.emplace(reassign_id ? counter : pair.first, pair.second);
             new_active_tracks.emplace(reassign_id ? counter : pair.first);
             counter++;
-
-        } else {
-            if (IsTrackValid(pair.first)) {
-                valid_tracks_counter_++;
-            }
         }
     }
     tracks_.swap(new_tracks);
@@ -539,17 +488,11 @@ void PedestrianTracker::DropForgottenTracks() {
     tracks_counter_ = reassign_id ? counter : tracks_counter_;
 }
 
-void PedestrianTracker::DropForgottenTrack(size_t track_id) {
-    PT_CHECK(IsTrackForgotten(track_id));
-    PT_CHECK(active_track_ids_.count(track_id) == 0);
-    tracks_.erase(track_id);
-}
-
 float PedestrianTracker::ShapeAffinity(float weight, const cv::Rect &trk,
                                        const cv::Rect &det) {
-    float w_dist = std::fabs(trk.width - det.width) / (trk.width + det.width);
-    float h_dist = std::fabs(trk.height - det.height) / (trk.height + det.height);
-    return exp(-weight * (w_dist + h_dist));
+    float w_dist = static_cast<float>(std::abs(trk.width - det.width) / (trk.width + det.width));
+    float h_dist = static_cast<float>(std::abs(trk.height - det.height) / (trk.height + det.height));
+    return static_cast<float>(exp(static_cast<double>(-weight * (w_dist + h_dist))));
 }
 
 float PedestrianTracker::MotionAffinity(float weight, const cv::Rect &trk,
@@ -558,12 +501,12 @@ float PedestrianTracker::MotionAffinity(float weight, const cv::Rect &trk,
         (det.width * det.width);
     float y_dist = static_cast<float>(trk.y - det.y) * (trk.y - det.y) /
         (det.height * det.height);
-    return exp(-weight * (x_dist + y_dist));
+    return static_cast<float>(exp(static_cast<double>(-weight * (x_dist + y_dist))));
 }
 
 float PedestrianTracker::TimeAffinity(float weight, const float &trk_time,
                                       const float &det_time) {
-    return exp(-weight * std::fabs(trk_time - det_time));
+    return static_cast<float>(exp(static_cast<double>(-weight * std::fabs(trk_time - det_time))));
 }
 
 void PedestrianTracker::ComputeFastDesciptors(
@@ -688,18 +631,7 @@ PedestrianTracker::StrongMatching(
         auto last_det = track.objects.back();
         last_det.rect = track.predicted_rect;
 
-        float affinity = reid_affinity * Affinity(last_det, detection);
-
-        if (collect_matches_ && last_det.object_id >= 0 &&
-            detection.object_id >= 0) {
-            reid_classifier_matches_.emplace_back(track.objects.back(), last_det.rect,
-                                                  detection,
-                                                  reid_affinity > params_.reid_thr);
-
-            reid_based_classifier_matches_.emplace_back(
-                track.objects.back(), last_det.rect, detection,
-                affinity > params_.aff_thr_strong);
-        }
+        float affinity = static_cast<float>(reid_affinity) * Affinity(last_det, detection);
 
         bool is_detection_matching =
             reid_affinity > params_.reid_thr && affinity > params_.aff_thr_strong;
@@ -787,19 +719,19 @@ float PedestrianTracker::AffinityFast(const cv::Mat &descriptor1,
                                       const TrackedObject &obj1,
                                       const cv::Mat &descriptor2,
                                       const TrackedObject &obj2) {
-    const float eps = 1e-6;
+    const float eps = 1e-6f;
     float shp_aff = ShapeAffinity(params_.shape_affinity_w, obj1.rect, obj2.rect);
-    if (shp_aff < eps) return 0.0;
+    if (shp_aff < eps) return 0.0f;
 
     float mot_aff =
         MotionAffinity(params_.motion_affinity_w, obj1.rect, obj2.rect);
-    if (mot_aff < eps) return 0.0;
+    if (mot_aff < eps) return 0.0f;
     float time_aff =
-        TimeAffinity(params_.time_affinity_w, obj1.frame_idx, obj2.frame_idx);
+        TimeAffinity(params_.time_affinity_w, static_cast<float>(obj1.frame_idx), static_cast<float>(obj2.frame_idx));
 
-    if (time_aff < eps) return 0.0;
+    if (time_aff < eps) return 0.0f;
 
-    float app_aff = 1.0 - distance_fast_->Compute(descriptor1, descriptor2);
+    float app_aff = 1.0f - distance_fast_->Compute(descriptor1, descriptor2);
 
     return shp_aff * mot_aff * app_aff * time_aff;
 }
@@ -810,7 +742,7 @@ float PedestrianTracker::Affinity(const TrackedObject &obj1,
     float mot_aff =
         MotionAffinity(params_.motion_affinity_w, obj1.rect, obj2.rect);
     float time_aff =
-        TimeAffinity(params_.time_affinity_w, obj1.frame_idx, obj2.frame_idx);
+        TimeAffinity(params_.time_affinity_w, static_cast<float>(obj1.frame_idx), static_cast<float>(obj2.frame_idx));
     return shp_aff * mot_aff * time_aff;
 }
 
@@ -832,14 +764,6 @@ bool PedestrianTracker::IsTrackForgotten(size_t id) const {
 
 bool PedestrianTracker::IsTrackForgotten(const Track &track) const {
     return (track.lost > params_.forget_delay);
-}
-
-size_t PedestrianTracker::Count() const {
-    size_t count = valid_tracks_counter_;
-    for (const auto &pair : tracks_) {
-        count += (IsTrackValid(pair.first) ? 1 : 0);
-    }
-    return count;
 }
 
 std::unordered_map<size_t, std::vector<cv::Point>>
@@ -892,43 +816,8 @@ cv::Mat PedestrianTracker::DrawActiveTracks(const cv::Mat &frame) {
     return out_frame;
 }
 
-const cv::Size kMinFrameSize = cv::Size(320, 240);
-const cv::Size kMaxFrameSize = cv::Size(1920, 1080);
-
-void PedestrianTracker::PrintConfusionMatrices() const {
-    std::cout << "Base classifier quality: " << std::endl;
-    {
-        auto cm = ConfusionMatrix(base_classifier_matches());
-        std::cout << cm << std::endl;
-        std::cout << "or" << std::endl;
-        cm.row(0) = cm.row(0) / std::max(1.0, cv::sum(cm.row(0))[0]);
-        cm.row(1) = cm.row(1) / std::max(1.0, cv::sum(cm.row(1))[0]);
-        std::cout << cm << std::endl << std::endl;
-    }
-
-    std::cout << "Reid-based classifier quality: " << std::endl;
-    {
-        auto cm = ConfusionMatrix(reid_based_classifier_matches());
-        std::cout << cm << std::endl;
-        std::cout << "or" << std::endl;
-        cm.row(0) = cm.row(0) / std::max(1.0, cv::sum(cm.row(0))[0]);
-        cm.row(1) = cm.row(1) / std::max(1.0, cv::sum(cm.row(1))[0]);
-        std::cout << cm << std::endl << std::endl;
-    }
-
-    std::cout << "Reid only classifier quality: " << std::endl;
-    {
-        auto cm = ConfusionMatrix(reid_classifier_matches());
-        std::cout << cm << std::endl;
-        std::cout << "or" << std::endl;
-        cm.row(0) = cm.row(0) / std::max(1.0, cv::sum(cm.row(0))[0]);
-        cm.row(1) = cm.row(1) / std::max(1.0, cv::sum(cm.row(1))[0]);
-        std::cout << cm << std::endl << std::endl;
-    }
-}
-
-void PedestrianTracker::PrintReidPerformanceCounts() const {
+void PedestrianTracker::PrintReidPerformanceCounts(std::string fullDeviceName) const {
     if (descriptor_strong_) {
-        descriptor_strong_->PrintPerformanceCounts();
+        descriptor_strong_->PrintPerformanceCounts(fullDeviceName);
     }
 }
